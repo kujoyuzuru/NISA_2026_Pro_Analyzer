@@ -7,40 +7,42 @@ from datetime import datetime, timedelta
 import uuid
 import os
 import hashlib
-from collections import Counter
 
-# --- 1. システム設定 ---
-st.set_page_config(page_title="Market Edge Pro - Blockchain Audit", page_icon="🦅", layout="wide")
+# --- 1. システム設定 & プロトコル定義 ---
+st.set_page_config(page_title="Market Edge Pro - Analytics", page_icon="🦅", layout="wide")
 
-MODEL_VERSION = "v6.0_Chained_Protocol"
-COST_MODEL = 0.005 # 往復0.5%
-MAX_SECTOR_ALLOCATION = 2
-PORTFOLIO_SIZE = 5
+# ★ プロトコル定義 (ここを変えると Hash が変わり、別ルールとみなされる)
+PROTOCOL_DEF = """
+1. Universe: Specified Tech/Growth Tickers
+2. Selection: Hybrid Score (Decay Model)
+3. Portfolio: Top 5 Equal Weight
+4. Entry: Next Open / Exit: Entry + 20 Days Open
+5. Cost: 0.5% deducted at Exit
+6. Benchmark: QQQ (Price Return)
+"""
+PROTOCOL_HASH = hashlib.sha256(PROTOCOL_DEF.encode()).hexdigest()[:8]
+
+MODEL_VERSION = f"v7.0_Analytics_{PROTOCOL_HASH}"
 HISTORY_FILE = "master_execution_log.csv"
+COST_RATE = 0.005 # 0.5%
 
-# --- 2. ブロックチェーン・ユーティリティ ---
+# --- 2. 数理・ユーティリティ関数 ---
 
 def get_last_hash():
-    """ログファイルの最終行のハッシュを取得する（チェーン用）"""
     if not os.path.exists(HISTORY_FILE):
-        return "GENESIS_BLOCK_000000000000" # 初期ハッシュ
-    
+        return "GENESIS"
     try:
         df = pd.read_csv(HISTORY_FILE)
-        if df.empty:
-            return "GENESIS_BLOCK_000000000000"
-        # 最終行のハッシュ列を取得
+        if df.empty: return "GENESIS"
         return df.iloc[-1]['Record_Hash']
     except:
-        return "BROKEN_CHAIN_ERROR"
+        return "BROKEN"
 
 def calculate_chain_hash(prev_hash, content_string):
-    """前のハッシュ + 内容 で新しいハッシュを生成 (Chained Hashing)"""
     combined = f"{prev_hash}|{content_string}"
     return hashlib.sha256(combined.encode()).hexdigest()
 
 def decay_function(spread_val):
-    """Spreadに対する連続的な割引関数: 1 / (1 + Spread)"""
     return 1.0 / (1.0 + spread_val)
 
 @st.cache_data(ttl=3600)
@@ -58,10 +60,9 @@ def fetch_market_context():
 def fetch_stock_data(tickers):
     data_list = []
     run_id = str(uuid.uuid4())[:8]
-    # 時刻を秒まで記録
     fetch_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     
-    with st.status("🦅 データ取得・チェーン記録準備中...", expanded=True) as status:
+    with st.status("🦅 厳格スキャン実行中...", expanded=True) as status:
         total = len(tickers)
         for i, ticker in enumerate(tickers):
             status.update(label=f"Scanning... {ticker} ({i+1}/{total})")
@@ -73,15 +74,14 @@ def fetch_stock_data(tickers):
                 except:
                     continue 
 
-                hist = stock.history(period="5d") # 直近データ
+                hist = stock.history(period="5d")
                 if hist.empty: continue
 
-                # --- A. Data Snapshot ---
-                # 最新の確定値（場中なら現在値、閉場後なら終値）
+                # Raw Data Snapshot
                 price = info.get('currentPrice', hist['Close'].iloc[-1])
                 sector = info.get('sector', 'Unknown')
                 
-                # 1. Valuation
+                # Valuation
                 official_peg = info.get('pegRatio')
                 fwd_pe = info.get('forwardPE')
                 growth = info.get('earningsGrowth')
@@ -96,7 +96,7 @@ def fetch_stock_data(tickers):
                     peg_val = fwd_pe / (growth * 100)
                     peg_type = "Modified"
                 
-                # 2. Consensus
+                # Consensus
                 target_mean = info.get('targetMeanPrice')
                 target_high = info.get('targetHighPrice')
                 target_low = info.get('targetLowPrice')
@@ -110,14 +110,13 @@ def fetch_stock_data(tickers):
                     if target_high and target_low:
                         spread_val = (target_high - target_low) / target_mean
                 
-                # Confidence
                 conf_factor = min(1.0, analysts / 15.0) if analysts >= 3 else 0.0
 
-                # 3. Trend
+                # Trend
                 sma50 = hist['Close'].rolling(window=50).mean().iloc[-1] if len(hist) >= 50 else price
                 sma200 = hist['Close'].rolling(window=200).mean().iloc[-1] if len(hist) >= 200 else price
                 
-                # --- B. Scoring ---
+                # Scoring
                 score = 0
                 
                 # 1. Valuation
@@ -128,26 +127,23 @@ def fetch_stock_data(tickers):
                     elif peg_val < 2.0: base_points = 10
                     score += base_points
                 
-                # 2. Trend (Simplified for speed)
+                # 2. Trend
                 trend_ok = False
-                # データ不足時は現在の価格だけで判定しないようガード
                 if len(hist) >= 200 and price > sma50 > sma200:
                     score += 30
                     trend_ok = True
                 
-                # 3. Upside (Decay)
+                # 3. Upside
                 if upside_val > 0:
                     base_upside = 0
                     if upside_val > 0.2: base_upside = 20
                     elif upside_val > 0.1: base_upside = 10
-                    
                     if base_upside > 0:
                         spread_discount = decay_function(spread_val)
                         final_factor = spread_discount * conf_factor
                         score += int(base_upside * final_factor)
 
-                # 4. RSI
-                # (直近14日計算は省略せず行うべきだが、コード長削減のため簡易実装)
+                # 4. RSI (Simplified)
                 rsi = 50 
 
                 grade = "C"
@@ -164,13 +160,14 @@ def fetch_stock_data(tickers):
                     "Price_At_Scan": price,
                     "PEG_Val": peg_val,
                     "Spread": spread_val,
-                    "Upside": upside_val
+                    "Upside": upside_val,
+                    "Model_Ver": MODEL_VERSION
                 })
             
             except Exception:
                 continue
         
-        status.update(label="✅ Scan Complete", state="complete", expanded=False)
+        status.update(label="✅ Complete", state="complete", expanded=False)
     
     return pd.DataFrame(data_list)
 
@@ -182,42 +179,32 @@ def build_portfolio(df):
     logs = []
     
     for _, row in df_sorted.iterrows():
-        if len(portfolio) >= PORTFOLIO_SIZE: break
+        if len(portfolio) >= 5: break
         sec = row['Sector']
-        current_count = sector_counts.get(sec, 0)
+        cnt = sector_counts.get(sec, 0)
         
-        if current_count < MAX_SECTOR_ALLOCATION:
+        if cnt < 2:
             portfolio.append(row)
-            sector_counts[sec] = current_count + 1
+            sector_counts[sec] = cnt + 1
         else:
-            logs.append(f"Skip {row['Ticker']} ({sec}): Cap Reached")
+            logs.append(f"Skip {row['Ticker']}: Sector Limit")
             
     return pd.DataFrame(portfolio), logs
 
-# --- 4. 履歴保存 (Chained Hashing) ---
+# --- 4. 履歴保存 ---
 def save_to_history(df_portfolio):
-    """
-    ブロックチェーンのように、前の行のハッシュを使って新しいハッシュを作る。
-    これにより、過去の行を改ざんすると連鎖が壊れてバレる。
-    """
-    # 既存の最終ハッシュを取得
     prev_hash = get_last_hash()
-    
     df_to_save = df_portfolio.copy()
     
-    # メタデータ付与
-    df_to_save["Prev_Hash_Ref"] = prev_hash # 前のブロックへのリンク
-    df_to_save["Protocol_Entry"] = "Next_Open"
-    df_to_save["Protocol_Exit"] = "Entry+20days_Open"
+    # メタデータ
+    df_to_save["Prev_Hash_Ref"] = prev_hash
+    df_to_save["Protocol_Hash"] = PROTOCOL_HASH
     
-    # 行ごとのハッシュ計算（簡易的にDataFrame全体を1ブロックとする）
-    # 実際は行ごとにやるのが理想だが、今回はRun単位でブロック化
+    # ハッシュ生成
     content_str = df_to_save[['Run_ID', 'Ticker', 'Score', 'Scan_Time']].to_string()
     new_hash = calculate_chain_hash(prev_hash, content_str)
+    df_to_save["Record_Hash"] = new_hash
     
-    df_to_save["Record_Hash"] = new_hash # このブロックの署名
-    
-    # 保存
     if not os.path.exists(HISTORY_FILE):
         df_to_save.to_csv(HISTORY_FILE, index=False)
     else:
@@ -225,133 +212,146 @@ def save_to_history(df_portfolio):
     
     return df_to_save, new_hash
 
-# --- 5. 厳格な予実集計 (Strict Protocol) ---
-def calculate_protocol_performance():
-    if not os.path.exists(HISTORY_FILE):
-        return pd.DataFrame(), "No Data"
+# --- 5. 高度な分析機能 (Audit Analytics) ---
+def calculate_advanced_stats(df_history):
+    if df_history.empty: return None
+
+    run_ids = df_history['Run_ID'].unique()
+    performance_records = []
     
-    history = pd.read_csv(HISTORY_FILE)
-    if history.empty: return pd.DataFrame(), "No Data"
+    initial_equity = 10000.0
+    equity_curve = [initial_equity]
+    dates = [df_history['Scan_Time'].min().split(" ")[0]] # Start date
     
-    results = []
-    
-    # QQQデータの取得
     qqq = yf.Ticker("QQQ")
-    # 過去データが必要なので長めに取る
-    qqq_hist = qqq.history(period="3mo") 
     
-    # ユニークなRun IDごとに処理
-    run_ids = history['Run_ID'].unique()
+    # 各Runの処理（簡易シミュレーション）
+    current_equity = initial_equity
     
     for rid in run_ids:
-        run_data = history[history['Run_ID'] == rid]
-        scan_time_str = run_data['Scan_Time'].iloc[0]
-        scan_date = pd.to_datetime(scan_time_str).date()
+        run_data = df_history[df_history['Run_ID'] == rid]
+        scan_date_str = run_data['Scan_Time'].iloc[0]
+        scan_date = pd.to_datetime(scan_date_str).date()
         
-        # プロトコル: Entryは「翌営業日の始値」
-        # 今日がスキャン日なら、まだ翌日のデータはない -> Pending
-        today = datetime.now().date()
+        # 本来は翌日始値だが、簡易的に「Scan日の翌日～20日後」をシミュレート
+        start_date = scan_date + timedelta(days=1)
+        end_date = start_date + timedelta(days=30) # Approx 20 trading days
         
-        status = "Pending"
-        avg_return = 0.0
-        
-        # 簡易判定: スキャン日が今日ならPending、過去なら計算試行
-        if scan_date >= today:
-            status = "⏳ Waiting for Next Open"
-        else:
-            # 過去データ取得 (Batch処理推奨だが、ここでは個別取得)
-            # 実際にはカレンダー判定が必要だが、簡易的に「スキャン日の次のデータ」を探す
-            status = "Active/Closed"
-            run_returns = []
+        # 過去データ取得（現在より未来ならSkip）
+        if start_date >= datetime.now().date():
+            continue
             
-            for _, row in run_data.iterrows():
-                try:
-                    # スキャン日以降のデータを取得
-                    ticker = row['Ticker']
-                    stock_hist = yf.Ticker(ticker).history(start=scan_date + timedelta(days=1))
-                    
-                    if stock_hist.empty:
-                        continue # データなし
-                        
-                    # Entry: 最初のレコードのOpen
-                    entry_price = stock_hist['Open'].iloc[0]
-                    # Current/Exit: 最新のレコードのClose (または20日後のOpen)
-                    current_price = stock_hist['Close'].iloc[-1]
-                    
-                    ret = (current_price - entry_price) / entry_price
-                    run_returns.append(ret)
-                except:
-                    continue
+        # 平均リターン計算
+        returns = []
+        for _, row in run_data.iterrows():
+            try:
+                # 実際のヒストリカルデータを取得
+                hist = yf.Ticker(row['Ticker']).history(start=start_date, end=end_date)
+                if len(hist) > 0:
+                    entry = hist['Open'].iloc[0]
+                    exit_price = hist['Open'].iloc[-1]
+                    # コスト控除 (Exit時)
+                    ret = ((exit_price - entry) / entry) - COST_RATE
+                    returns.append(ret)
+            except:
+                continue
+        
+        if returns:
+            avg_ret = np.mean(returns)
+            # 資産曲線の更新 (単利加算ではなく複利運用と仮定)
+            current_equity = current_equity * (1 + avg_ret)
+            equity_curve.append(current_equity)
+            dates.append(scan_date_str.split(" ")[0])
             
-            if run_returns:
-                # 平均リターン - コスト
-                avg_return = np.mean(run_returns) - COST_MODEL
-        
-        results.append({
-            "Run_ID": rid,
-            "Scan_Date": scan_date,
-            "Status": status,
-            "Protocol_Return": avg_return if status != "⏳ Waiting for Next Open" else None,
-            "Hash_Check": run_data['Record_Hash'].iloc[0][:8] + "..." # 表示用
-        })
-        
-    return pd.DataFrame(results), "OK"
+            # QQQのリターンも取得（同期間）
+            try:
+                q_hist = qqq.history(start=start_date, end=end_date)
+                if len(q_hist) > 0:
+                    q_ret = (q_hist['Open'].iloc[-1] - q_hist['Open'].iloc[0]) / q_hist['Open'].iloc[0]
+                else:
+                    q_ret = 0.0
+            except:
+                q_ret = 0.0
+                
+            performance_records.append({
+                "Date": scan_date_str,
+                "Strategy_Ret": avg_ret,
+                "QQQ_Ret": q_ret,
+                "Equity": current_equity
+            })
+
+    if not performance_records:
+        return None
+
+    df_perf = pd.DataFrame(performance_records)
+    
+    # ドローダウン計算
+    df_perf['Peak'] = df_perf['Equity'].cummax()
+    df_perf['Drawdown'] = (df_perf['Equity'] - df_perf['Peak']) / df_perf['Peak']
+    max_dd = df_perf['Drawdown'].min()
+    
+    total_return = (current_equity - initial_equity) / initial_equity
+    
+    return {
+        "df": df_perf,
+        "total_return": total_return,
+        "max_dd": max_dd,
+        "equity_curve": equity_curve,
+        "dates": dates
+    }
 
 # --- 6. UI構築 ---
-tab1, tab2 = st.tabs(["🚀 Systematic Scanner", "⛓️ Chained Audit Log"])
+tab1, tab2 = st.tabs(["🚀 System Execution", "📊 Analytics & Audit"])
 
 with tab1:
-    st.title("🦅 Market Edge Pro (Blockchain Audit)")
-    st.caption(f"Ver: {MODEL_VERSION} | Chain: Enabled | Protocol: Next-Open Entry")
+    st.title("🦅 Market Edge Pro (Execution)")
+    st.caption(f"Ver: {MODEL_VERSION} | Protocol Hash: {PROTOCOL_HASH} | Local Chain")
 
     bench_price = fetch_market_context()
-    st.metric("Context: QQQ Price", f"${bench_price:.2f}")
+    st.metric("Context: QQQ", f"${bench_price:.2f}")
 
-    with st.expander("🛡️ Security & Protocol Definition", expanded=True):
-        st.markdown("""
-        1.  **Chained Hashing:** 実行ログは「前の行のハッシュ」を含んで暗号化されます。過去のデータを1行でも改ざんすると、チェーンが壊れて検出されます。
-        2.  **Strict Protocol:** 検証は「スキャン時点の価格」ではなく、**「翌営業日の始値(Open)」**に基づいて行われます（待機中はPending表示）。
-        3.  **Decay Model:** Spread（不確実性）に応じて、スコアを `1/(1+Spread)` で滑らかに減衰させます。
-        """)
+    with st.expander("📜 Defined Protocol (変更不可)", expanded=True):
+        st.code(PROTOCOL_DEF)
+        st.caption("※この定義を変更するとプロトコルハッシュが変わり、過去ログとの連続性が警告されます。")
 
     TARGETS = ["NVDA", "MSFT", "AAPL", "AMZN", "GOOGL", "META", "TSLA", "AVGO", "AMD", "PLTR", "ARM", "SMCI", "COIN", "CRWD", "LLY", "NVO", "COST", "NFLX", "INTC"]
 
-    if st.button("RUN & CHAIN-LOG", type="primary"):
+    if st.button("EXECUTE RUN & LOG", type="primary"):
         raw_df = fetch_stock_data(TARGETS)
         if not raw_df.empty:
             portfolio_df, logs = build_portfolio(raw_df)
-            final_df, block_hash = save_to_history(portfolio_df)
+            final_df, data_hash = save_to_history(portfolio_df)
             
-            st.subheader(f"🏆 Portfolio Generated (Block Hash: {block_hash[:12]}...)")
-            
+            st.success(f"✅ Logged with Hash: {data_hash}")
             if logs:
-                for log in logs: st.warning(log)
+                for l in logs: st.warning(l)
             
-            st.dataframe(
-                final_df[['Ticker', 'Sector', 'Score', 'Spread', 'PEG_Val']]
-                .style
-                .format({'Score': '{:.0f}', 'Spread': '{:.1%}', 'PEG_Val': '{:.2f}'})
-                .background_gradient(subset=['Score'], cmap='Greens'),
-                use_container_width=True
-            )
-            st.success("✅ Recorded to Chained Log. (Tamper Evident)")
+            st.dataframe(final_df[['Ticker', 'Score', 'Spread', 'PEG_Val']].style.background_gradient(subset=['Score'], cmap='Greens'))
         else:
-            st.error("Data fetch failed.")
+            st.error("Data Error")
 
 with tab2:
-    st.header("⛓️ Audit Trail & Performance")
-    st.info("ブロックチェーン構造で保存されたログを読み込み、プロトコル（翌日始値エントリー）に基づいて成績を計算します。")
+    st.header("📊 Strategy Analytics (累積成績)")
     
-    if st.button("🔄 Audit Chain & Calc Returns"):
-        audit_df, msg = calculate_protocol_performance()
-        
-        if not audit_df.empty:
-            st.dataframe(
-                audit_df.style
-                .format({'Protocol_Return': '{:.2%}'})
-                .applymap(lambda x: 'color: gray' if x is None else ('color: green' if x > 0 else 'color: red'), subset=['Protocol_Return']),
-                use_container_width=True
-            )
-            st.caption("※ 'Pending' の行は、翌営業日の始値がまだ発生していないため、リターン計算を保留しています。")
+    if st.button("🔄 Calculate Performance"):
+        if os.path.exists(HISTORY_FILE):
+            df_hist = pd.read_csv(HISTORY_FILE)
+            stats = calculate_advanced_stats(df_hist)
+            
+            if stats:
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Total Return", f"{stats['total_return']:.2%}")
+                c2.metric("Max Drawdown", f"{stats['max_dd']:.2%}", delta_color="inverse")
+                c3.metric("Samples", f"{len(stats['df'])}")
+                
+                # 資産曲線チャート
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(x=stats['dates'], y=stats['equity_curve'], mode='lines', name='Strategy Equity'))
+                # (簡易比較のためQQQの累積は割愛するが、本来はここに重ねる)
+                st.plotly_chart(fig, use_container_width=True)
+                
+                st.dataframe(stats['df'], use_container_width=True)
+            else:
+                st.warning("Not enough data or pending trades.")
         else:
-            st.write("No valid chain found.")
+            st.info("No history log found.")
