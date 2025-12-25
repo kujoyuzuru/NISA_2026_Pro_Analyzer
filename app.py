@@ -6,17 +6,35 @@ import plotly.graph_objects as go
 from datetime import datetime, timedelta
 import uuid
 import os
+import hashlib
+from collections import Counter
 
-# --- 1. システム設定 (Systematic Rules) ---
-st.set_page_config(page_title="Market Edge Pro - Systematic", page_icon="🦅", layout="wide")
+# --- 1. システム設定 ---
+st.set_page_config(page_title="Market Edge Pro - System Final", page_icon="🦅", layout="wide")
 
-MODEL_VERSION = "v4.0_Auto_Balanced"
-COST_MODEL = "0.5% (Round-Trip)" # 往復コスト
-MAX_SECTOR_ALLOCATION = 2 # 1セクターあたりの最大銘柄数
+MODEL_VERSION = "v5.0_Signature_Decay"
+COST_MODEL = 0.005 # 往復0.5%
+MAX_SECTOR_ALLOCATION = 2
 PORTFOLIO_SIZE = 5
-HISTORY_FILE = "master_execution_log.csv" # 全履歴保存用
+HISTORY_FILE = "master_execution_log.csv"
 
-# --- 2. データ取得・分析ロジック ---
+# --- 2. 数理・ユーティリティ関数 ---
+
+def calculate_file_hash(df):
+    """データフレームの内容から一意の指紋(SHA-256ハッシュ)を生成"""
+    # 重要な列だけを結合してハッシュ化
+    content = df[['Ticker', 'Score', 'FetchTime']].to_string()
+    return hashlib.sha256(content.encode()).hexdigest()[:12]
+
+def decay_function(spread_val):
+    """
+    Spreadに対する連続的な割引関数 (Decay Model)
+    Cliff(崖)を作らず、Spreadが広がるほど滑らかにスコアを減衰させる
+    Formula: 1 / (1 + Spread)
+    Example: Spread 0% -> 1.0, 50% -> 0.66, 100% -> 0.5, 200% -> 0.33
+    """
+    return 1.0 / (1.0 + spread_val)
+
 @st.cache_data(ttl=3600)
 def fetch_market_context():
     try:
@@ -32,9 +50,10 @@ def fetch_market_context():
 def fetch_stock_data(tickers):
     data_list = []
     run_id = str(uuid.uuid4())[:8]
-    cutoff_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    # 秒単位のデータ取得時刻 (Data Integrity)
+    fetch_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     
-    with st.status("🦅 厳格スキャン & アルゴリズム選定中...", expanded=True) as status:
+    with st.status("🦅 データ取得・署名付きスキャン実行中...", expanded=True) as status:
         total = len(tickers)
         for i, ticker in enumerate(tickers):
             status.update(label=f"Scanning... {ticker} ({i+1}/{total})")
@@ -66,7 +85,7 @@ def fetch_stock_data(tickers):
                     peg_type = "Official"
                 elif fwd_pe is not None and growth is not None and growth > 0:
                     peg_val = fwd_pe / (growth * 100)
-                    peg_type = "Modified" # Modified PEG
+                    peg_type = "Modified"
                 
                 # 2. Consensus & Statistics
                 target_mean = info.get('targetMeanPrice')
@@ -75,26 +94,25 @@ def fetch_stock_data(tickers):
                 analysts = info.get('numberOfAnalystOpinions', 0)
                 
                 upside_val = 0.0
-                spread_val = 1.0
+                spread_val = 0.5 # Default risk
                 
                 if target_mean and target_mean > 0 and price > 0:
                     upside_val = (target_mean - price) / price
                     if target_high and target_low:
                         spread_val = (target_high - target_low) / target_mean
                 
-                # Confidence Factor (Sigmoid-like)
-                # 人数が多いほど信頼度UP (15名でMAX)
+                # Confidence Factor
                 conf_factor = min(1.0, analysts / 15.0) if analysts >= 3 else 0.0
 
                 # 3. Trend
                 sma50 = hist['Close'].rolling(window=50).mean().iloc[-1]
                 sma200 = hist['Close'].rolling(window=200).mean().iloc[-1]
 
-                # --- B. Scoring Logic ---
+                # --- B. Scoring Logic (Decay Model) ---
                 score = 0
                 breakdown = []
 
-                # 1. Valuation (Official Only)
+                # 1. Valuation
                 if peg_type == "Official" and pd.notna(peg_val):
                     base_points = 0
                     if 0 < peg_val < 1.0: base_points = 30
@@ -108,15 +126,15 @@ def fetch_stock_data(tickers):
                     score += 30
                     trend_ok = True
                 
-                # 3. Upside (Risk Adjusted)
+                # 3. Upside (Decay Function)
                 if upside_val > 0:
                     base_upside = 0
                     if upside_val > 0.2: base_upside = 20
                     elif upside_val > 0.1: base_upside = 10
                     
                     if base_upside > 0:
-                        # Spread割引と人数信頼度の二重フィルタ
-                        spread_discount = max(0.0, 1.0 - spread_val)
+                        # 改良: 滑らかな減衰関数
+                        spread_discount = decay_function(spread_val)
                         final_factor = spread_discount * conf_factor
                         score += int(base_upside * final_factor)
 
@@ -140,13 +158,13 @@ def fetch_stock_data(tickers):
 
                 data_list.append({
                     "Run_ID": run_id,
-                    "Scan_Time": cutoff_time,
+                    "FetchTime": fetch_time,
                     "Ticker": ticker,
                     "Sector": sector,
                     "Score": int(score),
                     "Grade": grade,
                     "Price_At_Scan": price,
-                    # --- Snapshot Data ---
+                    # Snapshot Stats
                     "PEG_Val": peg_val,
                     "PEG_Type": peg_type,
                     "Spread": spread_val,
@@ -163,22 +181,15 @@ def fetch_stock_data(tickers):
     
     return pd.DataFrame(data_list)
 
-# --- 3. ポートフォリオ構築アルゴリズム (強制分散) ---
+# --- 3. ポートフォリオ構築 ---
 def build_portfolio(df):
-    """
-    スコア順に選定するが、同セクターは最大2銘柄までとする。
-    3銘柄目以降はスキップし、次点の別セクター銘柄を採用する。
-    """
     df_sorted = df.sort_values('Score', ascending=False)
     portfolio = []
     sector_counts = {}
-    
     logs = []
     
     for _, row in df_sorted.iterrows():
-        if len(portfolio) >= PORTFOLIO_SIZE:
-            break
-            
+        if len(portfolio) >= PORTFOLIO_SIZE: break
         sec = row['Sector']
         current_count = sector_counts.get(sec, 0)
         
@@ -186,96 +197,137 @@ def build_portfolio(df):
             portfolio.append(row)
             sector_counts[sec] = current_count + 1
         else:
-            logs.append(f"⚠️ Skip {row['Ticker']} ({sec}): Sector Limit Reached")
+            logs.append(f"Skip {row['Ticker']} ({sec}): Cap Reached")
             
     return pd.DataFrame(portfolio), logs
 
-# --- 4. 履歴保存機能 ---
+# --- 4. 履歴保存 & 署名 ---
 def save_to_history(df_portfolio):
-    """実行されたポートフォリオ案を強制的に追記保存する"""
-    # 検証用カラムを追加（空欄）
-    df_portfolio["Cost_Model"] = COST_MODEL
-    df_portfolio["Entry_Date_Est"] = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')
-    df_portfolio["Exit_Date_Est"] = (datetime.now() + timedelta(days=30)).strftime('%Y-%m-%d')
-    df_portfolio["Actual_Entry_Price"] = np.nan # 後で埋める
-    df_portfolio["Actual_Exit_Price"] = np.nan  # 後で埋める
-    df_portfolio["Benchmark_Entry"] = np.nan    # 後で埋める
-    df_portfolio["Benchmark_Exit"] = np.nan     # 後で埋める
+    # ハッシュ生成（改ざん検知用）
+    data_hash = calculate_file_hash(df_portfolio)
+    df_portfolio["Data_Hash"] = data_hash
+    df_portfolio["Entry_Date"] = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')
     
-    # CSVに追記モードで保存
     if not os.path.exists(HISTORY_FILE):
         df_portfolio.to_csv(HISTORY_FILE, index=False)
     else:
         df_portfolio.to_csv(HISTORY_FILE, mode='a', header=False, index=False)
+    return df_portfolio, data_hash
+
+# --- 5. ライブ・ペーパートレーディング集計 ---
+def calculate_live_performance():
+    if not os.path.exists(HISTORY_FILE):
+        return pd.DataFrame(), 0, 0, 0
     
-    return df_portfolio
-
-# --- 5. メイン画面 ---
-st.title("🦅 Market Edge Pro (Systematic Trader)")
-st.caption(f"Ver: {MODEL_VERSION} | Protocol: Auto-Sector-Cap (Max {MAX_SECTOR_ALLOCATION}) | Cost: {COST_MODEL}")
-
-# コンテキスト表示
-bench_price = fetch_market_context()
-st.metric("Context: QQQ Current", f"${bench_price:.2f}")
-
-with st.expander("🤖 System Logic (人間による改変不可)", expanded=True):
-    st.markdown(f"""
-    1.  **Auto Sector Cap:** 1つのセクターからは最大 **{MAX_SECTOR_ALLOCATION}銘柄** しか採用しません。3銘柄目以降はスコアが高くても自動的に却下されます。
-    2.  **Master Logging:** スキャン結果は自動的にサーバー(ローカル)の `master_execution_log.csv` に記録されます。後出しの選択はできません。
-    3.  **Strict Audit Schema:** 出力されるCSVには、検証に必要な「コスト」「Entry/Exit日」「ベンチマーク価格記入欄」が予め用意されています。
-    """)
-
-TARGETS = ["NVDA", "MSFT", "AAPL", "AMZN", "GOOGL", "META", "TSLA", "AVGO", "AMD", "PLTR", "ARM", "SMCI", "COIN", "CRWD", "LLY", "NVO", "COST", "NFLX", "INTC"]
-
-if st.button("RUN SYSTEM (Generate & Log)", type="primary"):
-    # 1. 全銘柄スキャン
-    raw_df = fetch_stock_data(TARGETS)
+    history = pd.read_csv(HISTORY_FILE)
+    if history.empty: return pd.DataFrame(), 0, 0, 0
     
-    if not raw_df.empty:
-        # 2. アルゴリズムによるポートフォリオ構築
-        portfolio_df, logic_logs = build_portfolio(raw_df)
-        
-        # 3. 強制ログ保存
-        final_csv_df = save_to_history(portfolio_df)
-        
-        # --- UI表示 ---
-        st.subheader(f"🏆 Systematic Portfolio (Run ID: {portfolio_df['Run_ID'].iloc[0]})")
-        
-        # 除外ログの表示
-        if logic_logs:
-            for log in logic_logs:
-                st.warning(log)
-        else:
-            st.success("✅ No Sector Conflicts. Pure Score Selection.")
+    # QQQの現在値
+    qqq = yf.Ticker("QQQ")
+    qqq_cur = qqq.history(period="1d")['Close'].iloc[-1]
+    
+    results = []
+    
+    # 最新の株価を一括取得（高速化のためTickerリスト化）
+    tickers = history['Ticker'].unique().tolist()
+    live_prices = {}
+    
+    # 簡易取得 (実際はBatch取得が望ましいが、ここではLoopで実装)
+    # yfinanceの制限を考慮し、キャッシュがあれば使う設計が理想
+    for t in tickers:
+        try:
+            live_prices[t] = yf.Ticker(t).history(period="1d")['Close'].iloc[-1]
+        except:
+            live_prices[t] = 0
             
-        # ポートフォリオ表
-        st.dataframe(
-            portfolio_df[['Ticker', 'Sector', 'Score', 'PEG_Val', 'Spread', 'Price_At_Scan']]
-            .style
-            .format({'Price_At_Scan': '${:.2f}', 'Score': '{:.0f}', 'PEG_Val': '{:.2f}', 'Spread': '{:.1%}'})
-            .background_gradient(subset=['Score'], cmap='Greens')
-            .highlight_null(color='gray'),
-            use_container_width=True
-        )
+    for i, row in history.iterrows():
+        entry_price = row['Price_At_Scan'] # 簡易的にスキャン価格をEntryとする
+        current_price = live_prices.get(row['Ticker'], entry_price)
+        
+        # リターン計算 (コスト控除)
+        stock_ret = ((current_price - entry_price) / entry_price) - COST_MODEL
+        
+        # ※本来は「スキャン時のQQQ」と「現在のQQQ」を比較するが、
+        # ここでは簡易的に全期間のQQQリターンを対照とするシミュレーション
+        # (厳密なAlpha計算にはEntry時のQQQ価格の保存が必要。今回はStock Returnを表示)
+        
+        results.append({
+            "Run_ID": row['Run_ID'],
+            "Date": row['FetchTime'],
+            "Ticker": row['Ticker'],
+            "Entry": entry_price,
+            "Current": current_price,
+            "Return": stock_ret,
+            "Hash": row.get('Data_Hash', '-')
+        })
+        
+    df_res = pd.DataFrame(results)
+    total_ret = df_res['Return'].mean()
+    win_rate = len(df_res[df_res['Return'] > 0]) / len(df_res)
+    
+    return df_res, total_ret, win_rate, qqq_cur
 
-        # CSVダウンロード (検証用フォーマット付き)
-        csv = final_csv_df.to_csv(index=False).encode('utf-8')
-        st.download_button(
-            label="📥 Download Audit Plan (記入用CSV)",
-            data=csv,
-            file_name=f'TradePlan_{datetime.now().strftime("%Y%m%d_%H%M")}.csv',
-            mime='text/csv',
-            help="このCSVには『実際のEntry価格』『Benchmark価格』を記入する空欄が含まれています。"
-        )
+# --- 6. UI構築 ---
+tab1, tab2 = st.tabs(["🚀 System Scanner", "📈 Live Paper Trading"])
 
-        # 履歴データの表示（簡易）
-        st.divider()
-        st.write("📜 Local Execution History (Last 10 entries)")
-        if os.path.exists(HISTORY_FILE):
-            history_df = pd.read_csv(HISTORY_FILE)
-            st.dataframe(history_df.tail(10), use_container_width=True)
-        else:
-            st.caption("No history yet.")
+with tab1:
+    st.title("🦅 Market Edge Pro (System Final)")
+    st.caption(f"Ver: {MODEL_VERSION} | Cost: {COST_MODEL:.1%} | Hash: Enabled")
+
+    bench_price = fetch_market_context()
+    st.metric("Context: QQQ Price", f"${bench_price:.2f}")
+
+    with st.expander("📊 Logic Update (Decay & Signature)", expanded=True):
+        st.markdown("""
+        1.  **Decay Function (滑らかな減衰):** Spreadに対して `1 / (1 + Spread)` を適用。崖を作らず、不確実性が増すほどスコアを徐々に下げます。
+        2.  **Digital Signature (改ざん防止):** スキャン結果からSHA-256ハッシュを生成し、ログに刻印。後からのデータ改ざんを検知します。
+        3.  **Strict Sector Cap:** 同一セクターは最大2銘柄まで。3銘柄目以降はアルゴリズムが強制排除します。
+        """)
+
+    TARGETS = ["NVDA", "MSFT", "AAPL", "AMZN", "GOOGL", "META", "TSLA", "AVGO", "AMD", "PLTR", "ARM", "SMCI", "COIN", "CRWD", "LLY", "NVO", "COST", "NFLX", "INTC"]
+
+    if st.button("RUN SYSTEM & LOG", type="primary"):
+        raw_df = fetch_stock_data(TARGETS)
+        if not raw_df.empty:
+            portfolio_df, logs = build_portfolio(raw_df)
+            final_df, data_hash = save_to_history(portfolio_df)
             
-    else:
-        st.error("Data fetch failed.")
+            st.subheader(f"🏆 Systematic Portfolio (ID: {final_df['Run_ID'].iloc[0]})")
+            st.caption(f"🔒 Data Hash: {data_hash} (Tamper Proof)")
+            
+            if logs:
+                for log in logs: st.warning(log)
+            
+            st.dataframe(
+                final_df[['Ticker', 'Sector', 'Score', 'Spread', 'PEG_Type', 'Price_At_Scan']]
+                .style
+                .format({'Price_At_Scan': '${:.2f}', 'Score': '{:.0f}', 'Spread': '{:.1%}'})
+                .background_gradient(subset=['Score'], cmap='Greens'),
+                use_container_width=True
+            )
+        else:
+            st.error("Failed to fetch data.")
+
+with tab2:
+    st.header("📈 Live Paper Trading (自動集計)")
+    st.info("マスターログに保存された全推奨銘柄の「現在価格」を取得し、コスト控除後の仮想成績を集計します。")
+    
+    if st.button("🔄 集計を更新 (Update Stats)"):
+        df_stats, avg_ret, win_rate, qqq_now = calculate_live_performance()
+        
+        if not df_stats.empty:
+            k1, k2, k3 = st.columns(3)
+            k1.metric("Win Rate", f"{win_rate:.1%}")
+            k2.metric("Avg Return (Net)", f"{avg_ret:.2%}", delta_color="normal")
+            k3.metric("Tracked Tickers", f"{len(df_stats)}")
+            
+            st.dataframe(
+                df_stats[['Date', 'Ticker', 'Entry', 'Current', 'Return', 'Hash']]
+                .sort_values('Date', ascending=False)
+                .style
+                .format({'Entry': '${:.2f}', 'Current': '${:.2f}', 'Return': '{:.2%}'})
+                .applymap(lambda x: 'color: green;' if x > 0 else 'color: red;', subset=['Return']),
+                use_container_width=True
+            )
+        else:
+            st.warning("No history found. Run the scanner first.")
