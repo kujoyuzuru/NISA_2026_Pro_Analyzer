@@ -4,275 +4,198 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
-import uuid
 import os
 import hashlib
 
-# --- 1. システム設定 & 定数 ---
-st.set_page_config(page_title="Market Edge Pro", page_icon="🦅", layout="wide")
+# --- 1. システム設定 ---
+st.set_page_config(page_title="Market Edge Pro - Dashboard", page_icon="🦅", layout="wide")
 
-# ★ プロトコル定数 (裏側の憲法)
-PROTOCOL_VER = "v11.1_Compatibility_Fixed"
+# ファイル設定
 HISTORY_FILE = "master_execution_log.csv"
-COST_RATE = 0.005          
-MIN_INTERVAL_DAYS = 7      
-MAX_SPREAD_TOLERANCE = 0.8 
-PORTFOLIO_SIZE = 5         
-MAX_SECTOR_ALLOCATION = 2  
 
-# --- 2. 計算・セキュリティ関数 (裏方の仕事) ---
-
-def get_last_execution_time():
-    if not os.path.exists(HISTORY_FILE): return None
-    try:
-        df = pd.read_csv(HISTORY_FILE)
-        if df.empty: return None
-        return pd.to_datetime(df.iloc[-1]['Scan_Time'])
-    except:
-        return None
-
-def get_integrity_anchor():
-    """公開用検証コード (Anchor) を生成"""
-    if not os.path.exists(HISTORY_FILE): return "NO_DATA"
-    with open(HISTORY_FILE, "rb") as f:
-        return hashlib.sha256(f.read()).hexdigest()[:16]
-
-def calculate_chain_hash(prev_hash, content):
-    combined = f"{prev_hash}|{content}"
-    return hashlib.sha256(combined.encode()).hexdigest()
-
-def get_last_hash():
-    if not os.path.exists(HISTORY_FILE): return "GENESIS"
-    try:
-        df = pd.read_csv(HISTORY_FILE)
-        return df.iloc[-1]['Record_Hash'] if not df.empty else "GENESIS"
-    except:
-        return "BROKEN"
-
-def decay_function(spread):
-    return 1.0 / (1.0 + spread)
-
-# --- 3. データ取得・分析ロジック ---
+# --- 2. 分析ロジック (詳細化) ---
 
 @st.cache_data(ttl=3600)
 def fetch_stock_data(tickers):
     data_list = []
-    run_id = str(uuid.uuid4())[:8]
-    fetch_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     
-    with st.spinner("🦅 市場データを分析中..."):
+    with st.spinner("🦅 市場データを詳細分析中..."):
         for i, ticker in enumerate(tickers):
             try:
                 stock = yf.Ticker(ticker)
                 try: info = stock.info
                 except: continue 
 
-                hist = stock.history(period="5d")
+                hist = stock.history(period="6mo")
                 if hist.empty: continue
 
+                # --- 1. 基本データ ---
                 price = info.get('currentPrice', hist['Close'].iloc[-1])
+                name = info.get('shortName', ticker)
                 sector = info.get('sector', 'Unknown')
                 
-                # Valuation
-                peg_type = "-"
-                peg_val = np.nan
-                if info.get('pegRatio'):
-                    peg_val = info.get('pegRatio')
-                    peg_type = "Official"
+                # --- 2. 割安性 (Valuation) ---
+                # PEGレシオなどを取得
+                peg = info.get('pegRatio', np.nan)
+                fwd_pe = info.get('forwardPE', np.nan)
                 
-                # Consensus
-                target_mean = info.get('targetMeanPrice')
-                target_high = info.get('targetHighPrice')
-                target_low = info.get('targetLowPrice')
+                val_score = 0
+                val_msg = "判断不能"
+                if pd.notna(peg):
+                    if peg < 1.0: 
+                        val_score = 30
+                        val_msg = "S (超割安)"
+                    elif peg < 1.5: 
+                        val_score = 20
+                        val_msg = "A (割安)"
+                    elif peg < 2.0: 
+                        val_score = 10
+                        val_msg = "B (適正)"
+                    else: 
+                        val_msg = "C (割高感)"
+                
+                # --- 3. トレンド (Trend) ---
+                sma50 = hist['Close'].rolling(window=50).mean().iloc[-1]
+                sma200 = hist['Close'].rolling(window=200).mean().iloc[-1] if len(hist) > 200 else price
+                
+                trend_score = 0
+                trend_msg = "レンジ/下降"
+                if price > sma50 > sma200:
+                    trend_score = 30
+                    trend_msg = "S (上昇トレンド)"
+                elif price > sma50:
+                    trend_score = 15
+                    trend_msg = "A (短期上昇)"
+                
+                # --- 4. 機関投資家・コンセンサス (Consensus) ---
+                target_mean = info.get('targetMeanPrice', 0)
+                upside = (target_mean - price) / price if target_mean else 0
                 analysts = info.get('numberOfAnalystOpinions', 0)
                 
-                upside_val = 0.0
-                spread_val = 0.5 
-                if target_mean and target_mean > 0 and price > 0:
-                    upside_val = (target_mean - price) / price
-                    if target_high and target_low:
-                        spread_val = (target_high - target_low) / target_mean
+                cons_score = 0
+                if upside > 0.2: cons_score = 20
+                elif upside > 0.1: cons_score = 10
                 
-                conf_factor = min(1.0, analysts / 15.0) if analysts >= 3 else 0.0
-                sma50 = hist['Close'].rolling(window=50).mean().iloc[-1] if len(hist) >= 50 else price
-                sma200 = hist['Close'].rolling(window=200).mean().iloc[-1] if len(hist) >= 200 else price
+                # --- 5. 売買目安 (Support/Resistance) ---
+                # 押し目買いの目安としてSMA50を使用
+                buy_zone_high = sma50 * 1.02
+                buy_zone_low = sma50 * 0.98
                 
-                # Scoring
-                score = 0
-                filter_status = "OK"
+                # RSI計算
+                delta = hist['Close'].diff()
+                gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+                loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+                rs = gain / loss
+                rsi = 100 - (100 / (1 + rs)).iloc[-1]
                 
-                # Safety Valve
-                if spread_val > MAX_SPREAD_TOLERANCE:
-                    filter_status = "REJECT_RISK"
-                elif analysts < 3:
-                    filter_status = "REJECT_DATA"
-                else:
-                    if peg_type == "Official" and pd.notna(peg_val):
-                        if 0 < peg_val < 1.0: score += 30
-                        elif peg_val < 1.5: score += 20
-                        elif peg_val < 2.0: score += 10
-                    
-                    if len(hist) >= 5 and price > sma50 > sma200:
-                        score += 30
-                    
-                    if upside_val > 0:
-                        base = 20 if upside_val > 0.2 else (10 if upside_val > 0.1 else 0)
-                        if base > 0:
-                            score += int(base * decay_function(spread_val) * conf_factor)
+                # 総合スコア
+                total_score = val_score + trend_score + cons_score
+                
+                # RSIによる補正（過熱感があれば減点）
+                if rsi > 75: total_score -= 10
+                if rsi < 30: total_score += 10 # 売られすぎリバウンド狙い
 
                 data_list.append({
-                    "Run_ID": run_id,
-                    "Scan_Time": fetch_time,
                     "Ticker": ticker,
+                    "Name": name,
                     "Sector": sector,
-                    "Score": int(score),
-                    "Filter_Status": filter_status,
                     "Price": price,
-                    "Spread": spread_val,
-                    "PEG": peg_val
+                    "Total_Score": total_score,
+                    # 内訳
+                    "Val_Score": val_score,
+                    "Val_Msg": val_msg,
+                    "Trend_Score": trend_score,
+                    "Trend_Msg": trend_msg,
+                    "Upside": upside,
+                    "Analysts": analysts,
+                    "Target_Price": target_mean,
+                    "Buy_Zone": sma50, # 目安
+                    "RSI": rsi,
+                    "PEG": peg,
+                    "Fwd_PE": fwd_pe
                 })
             except: continue
             
     return pd.DataFrame(data_list)
 
-def build_portfolio(df):
-    df_valid = df[df['Filter_Status'] == "OK"].copy()
-    df_sorted = df_valid.sort_values('Score', ascending=False)
-    portfolio = []
-    sector_counts = {}
-    
-    for _, row in df_sorted.iterrows():
-        if len(portfolio) >= PORTFOLIO_SIZE: break
-        sec = row['Sector']
-        cnt = sector_counts.get(sec, 0)
-        if cnt < MAX_SECTOR_ALLOCATION:
-            portfolio.append(row)
-            sector_counts[sec] = cnt + 1
-            
-    return pd.DataFrame(portfolio)
+# --- 3. UI構築 ---
 
-def save_to_history(df_portfolio):
-    prev_hash = get_last_hash()
-    last_time = get_last_execution_time()
-    current_time = pd.to_datetime(df_portfolio['Scan_Time'].iloc[0])
-    
-    violation = ""
-    if last_time is not None:
-        delta = current_time - last_time
-        if delta.days < MIN_INTERVAL_DAYS:
-            violation = f"Too Soon ({delta.days} days)"
-    
-    df_save = df_portfolio.copy()
-    df_save["Prev_Hash"] = prev_hash
-    df_save["Violation"] = violation
-    
-    # Hash Chain
-    content = df_save[['Run_ID', 'Ticker', 'Score', 'Scan_Time']].to_string()
-    new_hash = calculate_chain_hash(prev_hash, content)
-    df_save["Record_Hash"] = new_hash
-    
-    if not os.path.exists(HISTORY_FILE):
-        df_save.to_csv(HISTORY_FILE, index=False)
-    else:
-        df_save.to_csv(HISTORY_FILE, mode='a', header=False, index=False)
-    
-    return df_save, violation
-
-# --- 4. 画面構築 ---
-
-mode = st.sidebar.radio("📱 モード選択", ["🚀 投資判断 (メイン)", "👮‍♂️ 監査・検証 (上級者)"])
+# サイドバー設定
+mode = st.sidebar.radio("モード切替", ["📊 銘柄分析ダッシュボード", "⚙️ ログ・設定 (裏方)"])
 
 TARGETS = ["NVDA", "MSFT", "AAPL", "AMZN", "GOOGL", "META", "TSLA", "AVGO", "AMD", "PLTR", "ARM", "SMCI", "COIN", "CRWD", "LLY", "NVO", "COST", "NFLX", "INTC"]
 
-# === モード A: 投資判断 ===
-if mode == "🚀 投資判断 (メイン)":
+if mode == "📊 銘柄分析ダッシュボード":
     st.title("🦅 Market Edge Pro")
-    st.caption("AIとアルゴリズムによる、客観的なポートフォリオ提案")
+    st.caption("「今、何が起きているか」を可視化し、あなたの投資判断をサポートします。")
     
-    st.info("👇 下のボタンを押すと、最新の市場データを分析し「今日のエントリー候補」を表示します。")
-    
-    if st.button("🚀 候補銘柄をスキャンする", type="primary"):
-        df = fetch_stock_data(TARGETS)
-        if not df.empty:
-            portfolio = build_portfolio(df)
-            
-            if not portfolio.empty:
-                save_to_history(portfolio)
-                
-                st.success("✅ 分析完了。以下の銘柄が抽出されました。")
-                st.markdown("### 📋 本日の推奨ポートフォリオ")
-                
-                display_df = portfolio[['Ticker', 'Sector', 'Price', 'Score', 'PEG']].copy()
-                display_df.columns = ['銘柄', 'セクター', '現在値($)', '総合スコア', '割安度(PEG)']
-                
-                st.dataframe(
-                    display_df.style
-                    .format({'現在値($)': '${:.2f}', '割安度(PEG)': '{:.2f}'})
-                    .background_gradient(subset=['総合スコア'], cmap='Greens'),
-                    use_container_width=True
-                )
-                
-                st.divider()
-                st.subheader("⚡ 次のアクション")
-                st.warning(f"""
-                1. **明日の市場オープン（始値）** で、上記5銘柄を等金額ずつ注文してください。
-                2. そのまま **20営業日（約1ヶ月）** 保有します。
-                3. 次回のチェックは **{MIN_INTERVAL_DAYS}日後** です。
-                """)
-            else:
-                st.error("⚠️ 本日は基準を満たす安全な銘柄がありませんでした。")
-        else:
-            st.error("データ取得エラー。時間をおいて再試行してください。")
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        st.info("💡 **使い方のヒント:** スコアが高い銘柄が良いとは限りません。「割安性」重視か「トレンド」重視か、ご自身の戦略に合わせてデータを見てください。")
+    with col2:
+        if st.button("🔄 最新データを取得"):
+            st.rerun()
 
-# === モード B: 監査・検証 ===
-else:
-    st.title("👮‍♂️ 監査・検証モード")
-    st.caption("内部ログの健全性確認、改ざん検知、パフォーマンス分析")
+    # データ取得
+    df = fetch_stock_data(TARGETS)
     
-    tab1, tab2 = st.tabs(["📜 実行ログ & アンカー", "📈 パフォーマンス分析"])
-    
-    with tab1:
-        st.subheader("公開用検証コード (Anchor)")
-        anchor = get_integrity_anchor()
-        if anchor != "NO_DATA":
-            st.code(anchor, language="text")
-            st.caption("※このコードをSNS等に投稿することで、データの存在証明になります。")
-        else:
-            st.write("履歴データがありません。")
-            
-        st.divider()
-        st.subheader("システム内部ログ (Raw Data)")
-        if os.path.exists(HISTORY_FILE):
-            hist_df = pd.read_csv(HISTORY_FILE)
-            st.dataframe(hist_df.sort_index(ascending=False))
-        else:
-            st.info("ログファイルはまだ生成されていません。")
-
-    with tab2:
-        st.subheader("確定損益の分析 (Closed Trades)")
+    if not df.empty:
+        # スコア順に並べ替え
+        df = df.sort_values('Total_Score', ascending=False)
         
-        if st.button("再集計を実行"):
-            if os.path.exists(HISTORY_FILE):
-                hist = pd.read_csv(HISTORY_FILE)
+        # --- メインリスト表示 ---
+        st.subheader("🔍 銘柄分析リスト")
+        
+        for i, row in df.iterrows():
+            # カード形式で表示
+            with st.expander(f"**{row['Ticker']}** : {row['Name']} (${row['Price']:.2f}) - スコア: {row['Total_Score']}/80"):
                 
-                # --- ★ 自動互換処理 (過去ログ対応) ---
-                if 'Violation' not in hist.columns:
-                    if 'Status_Flag' in hist.columns:
-                        hist.rename(columns={'Status_Flag': 'Violation'}, inplace=True)
+                # 3カラムレイアウト
+                c1, c2, c3 = st.columns(3)
+                
+                with c1:
+                    st.markdown("#### 1. 基礎体力 (Score)")
+                    st.progress(min(row['Total_Score'] / 80, 1.0))
+                    st.write(f"💰 **割安性:** {row['Val_Msg']} (PEG: {row['PEG']:.2f})")
+                    st.write(f"📈 **トレンド:** {row['Trend_Msg']}")
+                    st.write(f"🐋 **期待値:** +{row['Upside']:.1%} (目標株価: ${row['Target_Price']:.2f})")
+                
+                with c2:
+                    st.markdown("#### 2. 売買の目安 (Levels)")
+                    
+                    # 現在値とターゲットの距離
+                    st.metric("現在株価", f"${row['Price']:.2f}")
+                    
+                    # 買い目安（SMA50付近）
+                    dist_to_support = (row['Price'] - row['Buy_Zone']) / row['Price']
+                    support_color = "off"
+                    support_msg = "まだ高い (待ち)"
+                    if -0.02 < dist_to_support < 0.05:
+                        support_color = "normal"
+                        support_msg = "🎯 押し目ゾーン"
+                    
+                    st.metric("買い目安 (SMA50)", f"${row['Buy_Zone']:.2f}", 
+                              f"乖離 {dist_to_support:.1%}", delta_color="inverse")
+                    st.caption(f"判定: **{support_msg}**")
+
+                with c3:
+                    st.markdown("#### 3. テクニカル (Timing)")
+                    st.metric("RSI (過熱感)", f"{row['RSI']:.1f}")
+                    if row['RSI'] > 70:
+                        st.error("⚠️ 買われすぎ (高値掴み注意)")
+                    elif row['RSI'] < 30:
+                        st.success("✅ 売られすぎ (リバウンド好機)")
                     else:
-                        hist['Violation'] = np.nan
-                # ------------------------------------
-                
-                # NaNも空文字として扱う
-                hist['Violation'] = hist['Violation'].fillna("")
-                
-                valid_runs = hist[hist['Violation'] == ""].groupby('Run_ID').first()
-                
-                if not valid_runs.empty:
-                    st.metric("有効な実行回数", len(valid_runs))
-                    st.info("詳細な資産曲線（Equity Curve）は、20営業日経過後にここに表示されます。")
-                    st.dataframe(valid_runs[['Scan_Time', 'Record_Hash']])
-                else:
-                    st.warning("有効な（違反のない）実行記録がまだありません。")
-            else:
-                st.warning("履歴がありません。")
+                        st.info("➡️ 中立")
+                        
+                    st.markdown("---")
+                    st.caption(f"アナリスト数: {row['Analysts']}名 / セクター: {row['Sector']}")
+
+else:
+    st.title("⚙️ 管理・ログ画面")
+    st.write("ここは過去のデータログを確認する画面です。")
+    if os.path.exists(HISTORY_FILE):
+        hist_df = pd.read_csv(HISTORY_FILE)
+        st.dataframe(hist_df)
+    else:
+        st.write("履歴はありません。")
