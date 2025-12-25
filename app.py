@@ -8,41 +8,50 @@ import uuid
 import os
 import hashlib
 
-# --- 1. システム設定 & プロトコル定義 ---
-st.set_page_config(page_title="Market Edge Pro - Public Verifiable", page_icon="🦅", layout="wide")
+# --- 1. システム設定 & 定数定義 (ここが重要) ---
+st.set_page_config(page_title="Market Edge Pro - Final", page_icon="🦅", layout="wide")
 
-# ★ 憲法 (Protocol) - ここを変えると別システムとみなされる
-PROTOCOL_DEF = """
-[Protocol v9.0]
-1. Frequency: Weekly (Min 7 days interval)
-2. Safety Valve: Reject if Spread > 0.8 (80%)
-3. Cost Model: 0.5% deducted at Exit
-4. Universe: Tech/Growth Focus
-5. Anchor: Public Post Required
-"""
-PROTOCOL_HASH = hashlib.sha256(PROTOCOL_DEF.encode()).hexdigest()[:8]
-
-MODEL_VERSION = f"v9.0_Public_{PROTOCOL_HASH}"
+# ★ プロトコル定数 (憲法)
+PROTOCOL_VER = "v10.0_Final_Protocol"
 HISTORY_FILE = "master_execution_log.csv"
-COST_RATE = 0.005
-MIN_INTERVAL_DAYS = 7 # スキャン頻度制限
-MAX_SPREAD_TOLERANCE = 0.8 # 80%以上のバラつきは足切り
+
+# パラメータ設定
+COST_RATE = 0.005          # 往復コスト 0.5%
+MIN_INTERVAL_DAYS = 7      # スキャン頻度制限 (7日)
+MAX_SPREAD_TOLERANCE = 0.8 # Spread 80%以上は強制排除 (安全弁)
+PORTFOLIO_SIZE = 5         # ポートフォリオ銘柄数
+MAX_SECTOR_ALLOCATION = 2  # 1セクターあたりの最大数
 
 # --- 2. 数理・セキュリティ関数 ---
 
 def get_last_execution_time():
-    """前回の実行時刻を取得"""
+    """履歴ファイルから前回の実行時刻を取得"""
     if not os.path.exists(HISTORY_FILE):
         return None
     try:
         df = pd.read_csv(HISTORY_FILE)
         if df.empty: return None
+        # 最終行のScan_Timeを取得
         last_time_str = df.iloc[-1]['Scan_Time']
         return pd.to_datetime(last_time_str)
     except:
         return None
 
+def get_file_integrity_hash():
+    """履歴ファイル全体のハッシュ(Commitment Anchor)を生成"""
+    if not os.path.exists(HISTORY_FILE):
+        return "NO_DATA"
+    with open(HISTORY_FILE, "rb") as f:
+        bytes = f.read()
+        return hashlib.sha256(bytes).hexdigest()[:16] # 16桁
+
+def calculate_chain_hash(prev_hash, content_string):
+    """チェーンハッシュ生成"""
+    combined = f"{prev_hash}|{content_string}"
+    return hashlib.sha256(combined.encode()).hexdigest()
+
 def get_last_hash():
+    """前のブロックのハッシュを取得"""
     if not os.path.exists(HISTORY_FILE):
         return "GENESIS"
     try:
@@ -52,15 +61,12 @@ def get_last_hash():
     except:
         return "BROKEN"
 
-def calculate_chain_hash(prev_hash, content_string):
-    combined = f"{prev_hash}|{content_string}"
-    return hashlib.sha256(combined.encode()).hexdigest()
-
 def decay_function(spread_val):
-    """Spreadに対する連続的な割引関数 (1 / (1 + Spread))"""
+    """Spreadに対する連続的な割引関数"""
     return 1.0 / (1.0 + spread_val)
 
 def calculate_net_return(entry, exit, cost_rate):
+    """厳格なリターン計算"""
     if entry == 0: return 0.0
     gross_return = exit / entry
     net_return = gross_return * (1.0 - cost_rate) - 1.0
@@ -89,7 +95,7 @@ def fetch_stock_data(tickers):
                 hist = stock.history(period="5d")
                 if hist.empty: continue
 
-                # Raw Data Snapshot (Provenance)
+                # Raw Data
                 price = info.get('currentPrice', hist['Close'].iloc[-1])
                 sector = info.get('sector', 'Unknown')
                 
@@ -115,7 +121,7 @@ def fetch_stock_data(tickers):
                 analysts = info.get('numberOfAnalystOpinions', 0)
                 
                 upside_val = 0.0
-                spread_val = 0.5 # Default risk
+                spread_val = 0.5 
                 
                 if target_mean and target_mean > 0 and price > 0:
                     upside_val = (target_mean - price) / price
@@ -133,9 +139,9 @@ def fetch_stock_data(tickers):
                 score = 0
                 filter_status = "OK"
                 
-                # Safety Valve (安全弁)
+                # Safety Valve (安全弁: Spread過大は排除)
                 if spread_val > MAX_SPREAD_TOLERANCE:
-                    filter_status = f"REJECT:Spread({spread_val:.1%})>Max({MAX_SPREAD_TOLERANCE:.1%})"
+                    filter_status = f"REJECT:Spread({spread_val:.1%})>Limit"
                 elif analysts < 3:
                     filter_status = "REJECT:LowAnalysts"
                 else:
@@ -146,10 +152,8 @@ def fetch_stock_data(tickers):
                         elif peg_val < 2.0: score += 10
                     
                     # 2. Trend
-                    trend_ok = False
                     if len(hist) >= 5 and price > sma50 > sma200:
                         score += 30
-                        trend_ok = True
                     
                     # 3. Upside
                     if upside_val > 0:
@@ -167,7 +171,6 @@ def fetch_stock_data(tickers):
                 elif score >= 60: grade = "A"
                 elif score >= 40: grade = "B"
                 
-                # 却下された銘柄はスコア0扱い
                 if "REJECT" in filter_status:
                     score = 0
                     grade = "REJECT"
@@ -179,26 +182,21 @@ def fetch_stock_data(tickers):
                     "Sector": sector,
                     "Score": int(score),
                     "Filter_Status": filter_status,
-                    # Provenance Data (素性)
-                    "Price_Raw": price,
-                    "Target_Mean_Raw": target_mean,
-                    "Analysts_Raw": analysts,
+                    "Price_At_Scan": price,
                     "Spread_Raw": spread_val,
-                    "PEG_Raw": peg_val,
-                    "PEG_Source": peg_type,
-                    "Data_Source": "yfinance_free_tier"
+                    "PEG_Source": peg_type
                 })
             
             except Exception:
                 continue
         
-        status.update(label="✅ Complete", state="complete", expanded=False)
+        status.update(label="✅ Analysis Complete", state="complete", expanded=False)
     
     return pd.DataFrame(data_list)
 
-# --- 4. ポートフォリオ構築 ---
+# --- 4. ポートフォリオ構築 (セクター制限) ---
 def build_portfolio(df):
-    # フィルタ通過済みのみ対象
+    # REJECT以外を対象
     df_valid = df[df['Filter_Status'] == "OK"].copy()
     df_sorted = df_valid.sort_values('Score', ascending=False)
     
@@ -207,37 +205,37 @@ def build_portfolio(df):
     logs = []
     
     for _, row in df_sorted.iterrows():
-        if len(portfolio) >= 5: break
+        if len(portfolio) >= PORTFOLIO_SIZE: break
         sec = row['Sector']
         cnt = sector_counts.get(sec, 0)
         
-        if cnt < 2:
+        if cnt < MAX_SECTOR_ALLOCATION:
             portfolio.append(row)
             sector_counts[sec] = cnt + 1
         else:
-            logs.append(f"Skip {row['Ticker']}: Sector Cap")
+            logs.append(f"Skip {row['Ticker']}: Sector Limit ({sec})")
             
     return pd.DataFrame(portfolio), logs
 
-# --- 5. 履歴保存 & アンカー生成 ---
+# --- 5. 履歴保存 (頻度チェック + ハッシュチェーン) ---
 def save_to_history(df_portfolio):
     prev_hash = get_last_hash()
     last_time = get_last_execution_time()
     current_time = pd.to_datetime(df_portfolio['Scan_Time'].iloc[0])
     
-    # 頻度チェック (Frequency Check)
+    # 頻度違反チェック
     violation_flag = ""
     if last_time is not None:
         delta = current_time - last_time
         if delta.days < MIN_INTERVAL_DAYS:
-            violation_flag = f"[VIOLATION: Too Soon ({delta.days} days < {MIN_INTERVAL_DAYS})]"
+            violation_flag = f"VIOLATION: Too Soon ({delta.days} days)"
     
     df_to_save = df_portfolio.copy()
     df_to_save["Prev_Hash"] = prev_hash
-    df_to_save["Protocol_Hash"] = PROTOCOL_HASH
-    df_to_save["Status_Flag"] = violation_flag # 違反があれば記録される
+    df_to_save["Protocol_Ver"] = PROTOCOL_VER
+    df_to_save["Status_Flag"] = violation_flag
     
-    # ハッシュ生成
+    # チェーンハッシュ生成
     content = df_to_save[['Run_ID', 'Ticker', 'Score', 'Scan_Time']].to_string()
     new_hash = calculate_chain_hash(prev_hash, content)
     df_to_save["Record_Hash"] = new_hash
@@ -249,31 +247,79 @@ def save_to_history(df_portfolio):
     
     return df_to_save, new_hash, violation_flag
 
-# --- 6. 監査機能 ---
+# --- 6. 監査機能 (Closed Trade) ---
 def audit_performance():
     if not os.path.exists(HISTORY_FILE): return None
     history = pd.read_csv(HISTORY_FILE)
     if history.empty: return None
     
-    # ここでは「確定した取引」のみを抽出するロジック（省略版）
-    # ... (前回のAuditロジックと同様)
-    return history # 仮
+    # 違反フラグがある行は除外
+    valid_history = history[history['Status_Flag'].isna() | (history['Status_Flag'] == "")]
+    if valid_history.empty: return None
+    
+    run_ids = valid_history['Run_ID'].unique()
+    closed_trades = []
+    
+    progress_bar = st.progress(0)
+    
+    for i, rid in enumerate(run_ids):
+        run_data = valid_history[valid_history['Run_ID'] == rid]
+        scan_time = pd.to_datetime(run_data['Scan_Time'].iloc[0])
+        
+        # 翌営業日Entry -> 20営業日後Exit (簡易カレンダー計算)
+        entry_date = scan_time.date() + timedelta(days=1)
+        exit_date_est = entry_date + timedelta(days=30)
+        
+        today = datetime.now().date()
+        
+        # まだ閉じていないトレードはスキップ
+        if today < exit_date_est:
+            continue
+            
+        for _, row in run_data.iterrows():
+            ticker = row['Ticker']
+            try:
+                # 期間データ取得
+                df_price = yf.Ticker(ticker).history(start=entry_date, end=exit_date_est + timedelta(days=5))
+                if df_price.empty: continue
+                
+                real_entry = df_price['Open'].iloc[0]
+                idx = min(len(df_price)-1, 20)
+                real_exit = df_price['Open'].iloc[idx]
+                
+                net_ret = calculate_net_return(real_entry, real_exit, COST_RATE)
+                
+                closed_trades.append({
+                    "Run_ID": rid,
+                    "Ticker": ticker,
+                    "Exit_Date": df_price.index[idx].date(),
+                    "Net_Return": net_ret
+                })
+            except:
+                continue
+        
+        progress_bar.progress((i + 1) / len(run_ids))
+        
+    return pd.DataFrame(closed_trades)
 
 # --- 7. UI構築 ---
-tab1, tab2 = st.tabs(["🚀 Systematic Execution", "⚖️ Performance & Audit"])
+tab1, tab2 = st.tabs(["🚀 Execution & Anchor", "⚖️ Performance Audit"])
 
 with tab1:
     st.title("🦅 Market Edge Pro (Public Verifiable)")
+    
+    # 定数変数の参照エラーを防ぐため、ここで使用
     st.caption(f"Ver: {PROTOCOL_VER} | Interval: {MIN_INTERVAL_DAYS} Days | Safety: Spread < {MAX_SPREAD_TOLERANCE:.0%}")
     
-    # プロトコル表示
-    with st.expander("📜 Protocol Definition (憲法)", expanded=True):
-        st.code(PROTOCOL_DEF)
-        st.info("※この定義に従い、Spread過大銘柄は自動排除され、週次実行が強制されます。")
+    # 公開用アンカーの表示
+    anchor = get_file_integrity_hash()
+    if anchor != "NO_DATA":
+        st.info(f"🔒 **Commitment Anchor (Current):** `{anchor}`")
+        st.caption("このコードをSNS等に記録してください。")
 
     TARGETS = ["NVDA", "MSFT", "AAPL", "AMZN", "GOOGL", "META", "TSLA", "AVGO", "AMD", "PLTR", "ARM", "SMCI", "COIN", "CRWD", "LLY", "NVO", "COST", "NFLX", "INTC"]
 
-    if st.button("EXECUTE RUN & GENERATE ANCHOR", type="primary"):
+    if st.button("EXECUTE RUN", type="primary"):
         raw_df = fetch_stock_data(TARGETS)
         if not raw_df.empty:
             portfolio_df, logs = build_portfolio(raw_df)
@@ -283,35 +329,54 @@ with tab1:
                 
                 if violation:
                     st.error(f"⚠️ PROTOCOL VIOLATION: {violation}")
-                    st.warning("この記録は「違反」としてログに残りました。正規のトラックレコードには含まれません。")
+                    st.write("規定の期間(7日)を経過していないため、正規記録として認められません。")
                 else:
                     st.success("✅ Logged Successfully. (Protocol Compliant)")
                     
-                    # 公開用アンカー生成
-                    run_id = final_df['Run_ID'].iloc[0]
-                    short_hash = record_hash[:12]
-                    date_str = datetime.now().strftime('%Y-%m-%d')
-                    
-                    anchor_text = f"MEP_ANCHOR: {date_str} | ID: {run_id} | HASH: {short_hash} | #MarketEdgePro"
+                    # 新しいアンカー
+                    new_anchor = get_file_integrity_hash()
                     
                     st.divider()
-                    st.subheader("📢 Public Verification Anchor")
-                    st.write("以下のテキストをSNS(Xなど)やGitコミットログに投稿してください。これが「第三者証明」になります。")
+                    st.subheader("📢 New Public Anchor")
+                    st.caption("Copy this text and post it publicly:")
+                    
+                    # エラー修正: label引数を削除
+                    anchor_text = f"MEP_ANCHOR | Date:{datetime.now().date()} | Hash:{new_anchor}"
                     st.code(anchor_text, language="text")
                     
-                    # データ表示
-                    st.dataframe(final_df[['Ticker', 'Score', 'Spread_Raw', 'Filter_Status', 'Price_At_Scan']].style.background_gradient(subset=['Score'], cmap='Greens'))
+                    if logs:
+                        for l in logs: st.warning(l)
+                    
+                    st.dataframe(final_df[['Ticker', 'Score', 'Spread_Raw', 'Price_At_Scan']].style.background_gradient(subset=['Score'], cmap='Greens'))
             else:
-                st.error("No valid tickers passed the Safety Valve (Spread Filter). Market is too risky.")
-                st.dataframe(raw_df[['Ticker', 'Spread_Raw', 'Filter_Status']])
+                st.error("No valid tickers passed the Safety Valve.")
+                st.dataframe(raw_df[['Ticker', 'Filter_Status', 'Spread_Raw']])
         else:
             st.error("Data fetch error")
 
 with tab2:
-    st.header("⚖️ Audit Trail")
-    if os.path.exists(HISTORY_FILE):
-        hist = pd.read_csv(HISTORY_FILE)
-        st.dataframe(hist.sort_index(ascending=False))
-        st.caption("Raw Metadata (Provenance): Analysts_Raw, Target_Mean_Raw, Data_Source columns are available in CSV.")
-    else:
-        st.info("No history yet.")
+    st.header("⚖️ Audit Trail (Closed Trades)")
+    
+    if st.button("🔄 Audit Performance"):
+        df_closed = audit_performance()
+        
+        if df_closed is not None and not df_closed.empty:
+            df_closed = df_closed.sort_values('Exit_Date')
+            df_closed['Equity_Curve'] = (1 + df_closed['Net_Return']).cumprod()
+            
+            total_ret = df_closed['Equity_Curve'].iloc[-1] - 1
+            peak = df_closed['Equity_Curve'].cummax()
+            dd = (df_closed['Equity_Curve'] - peak) / peak
+            max_dd = dd.min()
+            
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Total Return", f"{total_ret:.2%}")
+            c2.metric("Max Drawdown", f"{max_dd:.2%}", delta_color="inverse")
+            c3.metric("Trades", len(df_closed))
+            
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=df_closed['Exit_Date'], y=df_closed['Equity_Curve'], mode='lines+markers', name='Equity'))
+            st.plotly_chart(fig, use_container_width=True)
+            st.dataframe(df_closed)
+        else:
+            st.warning("No closed trades found (or no history).")
