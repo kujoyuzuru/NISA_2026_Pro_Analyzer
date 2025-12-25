@@ -12,7 +12,7 @@ import hashlib
 st.set_page_config(page_title="Market Edge Pro - Integrity", page_icon="🦅", layout="wide")
 
 # プロトコル定義 (憲法)
-PROTOCOL_VER = "v8.0_Integrity_Audit"
+PROTOCOL_VER = "v8.1_Integrity_Fixed"
 COST_RATE = 0.005 # 往復0.5% (Exit時に控除)
 HOLDING_DAYS = 20 # 営業日換算
 HISTORY_FILE = "master_execution_log.csv"
@@ -226,8 +226,7 @@ def audit_performance():
         scan_time = pd.to_datetime(run_data['Scan_Time'].iloc[0])
         
         # プロトコル: EntryはScan翌日、ExitはScan+1+20日
-        # 営業日計算は複雑なので、簡易的にカレンダー日で判定
-        entry_date = scan_date = scan_time.date() + timedelta(days=1)
+        entry_date = scan_time.date() + timedelta(days=1)
         exit_date_est = entry_date + timedelta(days=30) # Approx 20 trading days
         
         today = datetime.now().date()
@@ -238,9 +237,6 @@ def audit_performance():
             
         # 2. 期間終了済み (Closed)
         is_closed = today >= exit_date_est
-        
-        # バッチ取得で高速化したいが、ここでは個別取得
-        # (実運用では yf.download(..., group_by='ticker') を推奨)
         
         run_pnl = []
         
@@ -316,9 +312,10 @@ with tab1:
             
             st.success("✅ Logged. Update your anchor.")
             
-            # 最新のアンカーを再計算して表示
+            # 最新のアンカーを再計算して表示 (修正済み)
             new_anchor = get_file_integrity_hash()
-            st.code(new_anchor, language="text", label="New Commitment Anchor (Copy this)")
+            st.caption("New Commitment Anchor (Copy this):")
+            st.code(new_anchor, language="text") # label引数を削除しcaptionで代用
             
             if logs:
                 for l in logs: st.warning(l)
@@ -337,6 +334,7 @@ with tab2:
         if df_closed is not None and not df_closed.empty:
             # 資産曲線の作成
             df_closed = df_closed.sort_values('Exit_Date')
+            # 単利累積ではなく、日次ベースの累積などを簡易化して表示
             df_closed['Cumulative_Return'] = (1 + df_closed['Net_Return']).cumprod()
             
             # ドローダウン
@@ -351,8 +349,7 @@ with tab2:
             k2.metric("Max Drawdown", f"{max_dd:.2%}", delta_color="inverse")
             k3.metric("Closed Trades", f"{len(df_closed)}")
             
-            # チャート
-            
+            # チャート描画
             fig = go.Figure()
             fig.add_trace(go.Scatter(x=df_closed['Exit_Date'], y=df_closed['Cumulative_Return'], mode='lines+markers', name='Equity (Net)'))
             st.plotly_chart(fig, use_container_width=True)
