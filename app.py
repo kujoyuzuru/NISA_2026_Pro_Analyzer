@@ -8,7 +8,7 @@ import uuid
 import os
 import hashlib
 
-# --- 1. システム設定 & 定数定義 (ここが重要) ---
+# --- 1. システム設定 & 定数定義 (ここが重要: 最初に定義) ---
 st.set_page_config(page_title="Market Edge Pro - Final", page_icon="🦅", layout="wide")
 
 # ★ プロトコル定数 (憲法)
@@ -308,7 +308,7 @@ tab1, tab2 = st.tabs(["🚀 Execution & Anchor", "⚖️ Performance Audit"])
 with tab1:
     st.title("🦅 Market Edge Pro (Public Verifiable)")
     
-    # 定数変数の参照エラーを防ぐため、ここで使用
+    # 定数を参照
     st.caption(f"Ver: {PROTOCOL_VER} | Interval: {MIN_INTERVAL_DAYS} Days | Safety: Spread < {MAX_SPREAD_TOLERANCE:.0%}")
     
     # 公開用アンカーの表示
@@ -329,7 +329,7 @@ with tab1:
                 
                 if violation:
                     st.error(f"⚠️ PROTOCOL VIOLATION: {violation}")
-                    st.write("規定の期間(7日)を経過していないため、正規記録として認められません。")
+                    st.write(f"規定の期間({MIN_INTERVAL_DAYS}日)を経過していないため、正規記録として認められません。")
                 else:
                     st.success("✅ Logged Successfully. (Protocol Compliant)")
                     
@@ -340,7 +340,7 @@ with tab1:
                     st.subheader("📢 New Public Anchor")
                     st.caption("Copy this text and post it publicly:")
                     
-                    # エラー修正: label引数を削除
+                    # 修正点: label引数を削除
                     anchor_text = f"MEP_ANCHOR | Date:{datetime.now().date()} | Hash:{new_anchor}"
                     st.code(anchor_text, language="text")
                     
