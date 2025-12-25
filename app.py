@@ -6,31 +6,37 @@ from datetime import datetime
 import os
 import hashlib
 import uuid
+import pytz
 
-# --- 1. v1.0 仕様定義 (憲法) ---
+# --- 1. アプリ設定 & 用語辞書 (仕様固定) ---
 st.set_page_config(page_title="Market Edge Pro v1.0", page_icon="🦅", layout="wide")
 
-HISTORY_FILE = "master_execution_log.csv"
-PROTOCOL_VER = "v1.0_Final_Spec"
+VERSION = "v1.0_Standard"
+HISTORY_FILE = "execution_log_v1.csv"
 
-# 【仕様固定】判定パラメータ
-SPEC = {
-    "SMA_PERIOD": 50,       # 50日移動平均
-    "ATR_PERIOD": 14,       # 14日平均ボラティリティ
-    "STOP_MULT": 2.0,       # 損切幅: ATRの2倍
-    "TARGET_MULT": 4.0,     # 目標幅: ATRの4倍 (短期)
-    "RR_THRESHOLD": 2.00,   # R/R 閾値: 2.00以上で合格
-    "DIP_LIMIT": 0.05       # 押し目許容: SMA+5%以内
+# 用語・判定ルールの一括定義 (仕様 6, 8)
+APP_SPEC = {
+    "SMA_PERIOD": 50,
+    "ATR_PERIOD": 14,
+    "STOP_MULT": 2.0,      # 損切り幅算出用
+    "TARGET_MULT": 4.0,    # 短期目標算出用
+    "RR_THRESHOLD": 2.00,  # 合格R/R
+    "DIP_LIMIT": 0.05      # 押し目許容(SMA50から+5%以内)
 }
 
-# --- 2. ユーティリティ ---
+# 表示文言の統一 (仕様 4, 8)
+LBL = {
+    "ACTION_NOW": "今すぐ検討",
+    "WATCH": "監視・待機",
+    "EXCLUDE": "対象外",
+    "STEP_BUY": "本日終値がルール条件を満たすか確認し、満たしたら発注準備",
+    "STEP_RR": "損切り幅が想定内か再確認",
+    "STEP_WAIT_PRICE": "再確認ライン付近までの調整を待つ",
+    "STEP_WAIT_TREND": "上昇トレンドへの回帰を待つ",
+    "STEP_NONE": "今は何もしない"
+}
 
-def get_verification_code():
-    if not os.path.exists(HISTORY_FILE): return "NO_DATA"
-    with open(HISTORY_FILE, "rb") as f:
-        return hashlib.sha256(f.read()).hexdigest()[:12]
-
-# --- 3. 分析エンジン (検算・整合性重視) ---
+# --- 2. 内部エンジン (仕様 5, 6) ---
 
 def calculate_atr(df, period=14):
     high_low = df['High'] - df['Low']
@@ -40,37 +46,42 @@ def calculate_atr(df, period=14):
     return ranges.max(axis=1).rolling(period).mean().iloc[-1]
 
 @st.cache_data(ttl=3600)
-def analyze_market_v1(tickers):
+def fetch_and_analyze(tickers):
     results = []
     run_id = str(uuid.uuid4())[:8]
-    fetch_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    now_jp = datetime.now(pytz.timezone('Asia/Tokyo'))
+    now_ny = datetime.now(pytz.timezone('America/New_York'))
     
-    for ticker in tickers:
+    status_msg = st.empty()
+    progress_bar = st.progress(0)
+    
+    for i, ticker in enumerate(tickers):
+        status_msg.text(f"診断中... ({i+1}/{len(tickers)}): {ticker}")
+        progress_bar.progress((i + 1) / len(tickers))
         try:
             stock = yf.Ticker(ticker)
-            info = stock.info
             hist = stock.history(period="6mo")
             if len(hist) < 60: continue
-
-            price = info.get('currentPrice', hist['Close'].iloc[-1])
-            name = info.get('shortName', ticker)
             
-            # --- 指標計算 ---
-            sma_series = hist['Close'].rolling(window=SPEC["SMA_PERIOD"]).mean()
+            # データ鮮度確認 (仕様 5)
+            last_date = hist.index[-1].strftime('%Y-%m-%d')
+            price = hist['Close'].iloc[-1]
+            
+            # 指標計算
+            sma_series = hist['Close'].rolling(window=APP_SPEC["SMA_PERIOD"]).mean()
             sma50 = sma_series.iloc[-1]
             sma50_prev = sma_series.iloc[-5]
-            atr = calculate_atr(hist, SPEC["ATR_PERIOD"])
+            atr = calculate_atr(hist, APP_SPEC["ATR_PERIOD"])
             
-            # --- 判定項目 (検算用生データ) ---
-            c_trend = price > sma50 and sma50 > sma50_prev
-            c_dist = (price - sma50) / sma50
-            c_dip = 0 < c_dist <= SPEC["DIP_LIMIT"]
+            # 判定条件
+            is_uptrend = price > sma50 and sma50 > sma50_prev
+            dist_sma = (price - sma50) / sma50
             
-            # 損切・目標・R/R (小数2桁で固定)
-            stop = round(price - (atr * SPEC["STOP_MULT"]), 2)
-            target = round(price + (atr * SPEC["TARGET_MULT"]), 2)
-            risk = price - stop
-            reward = target - price
+            # 損切・目標・R/R (小数2桁固定 仕様 6)
+            stop_price = round(price - (atr * APP_SPEC["STOP_MULT"]), 2)
+            target_price = round(price + (atr * APP_SPEC["TARGET_MULT"]), 2)
+            risk = price - stop_price
+            reward = target_price - price
             rr_val = round(reward / risk, 2) if risk > 0 else -1.0
             
             # RSI
@@ -79,71 +90,112 @@ def analyze_market_v1(tickers):
             loss = -delta.where(delta < 0, 0).rolling(14).mean()
             rsi = (100 - (100 / (1 + (gain / loss)))).clip(0, 100).iloc[-1]
 
-            # --- 分類ロジック (唯一の正解) ---
+            # 分類ロジック (仕様 4, 8)
             if rr_val < 0 or np.isnan(rsi):
-                action, reason = "除外", "データ不整合"
-            elif not c_trend:
-                action, reason = "除外", "トレンド不適合(SMA50割れ/向き下)"
-            elif rr_val < SPEC["RR_THRESHOLD"]:
-                action, reason = "待機", f"利幅/損幅比不足 (R/R {rr_val:.2f} < {SPEC['RR_THRESHOLD']})"
-            elif rsi >= 70 or c_dist > SPEC["DIP_LIMIT"]:
-                action, reason = "監視", f"過熱・乖離 (RSI:{rsi:.0f}/乖離:{c_dist*100:.1f}%)"
+                cat, reason, step = LBL["EXCLUDE"], "データ不整合", LBL["STEP_NONE"]
+            elif not is_uptrend:
+                cat, reason, step = LBL["EXCLUDE"], "トレンド不適合", LBL["STEP_WAIT_TREND"]
+            elif rr_val < APP_SPEC["RR_THRESHOLD"]:
+                cat, reason, step = LBL["WATCH"], f"R/R不足({rr_val:.2f})", LBL["STEP_RR"]
+            elif rsi >= 70 or dist_sma > APP_SPEC["DIP_LIMIT"]:
+                cat, reason, step = LBL["WATCH"], "過熱・乖離あり", LBL["STEP_WAIT_PRICE"]
             else:
-                action, reason = "買い候補", "全条件合致 (検証済)"
+                cat, reason, step = LBL["ACTION_NOW"], "全条件合致", LBL["STEP_BUY"]
 
             results.append({
-                "Run_ID": run_id, "スキャン時刻": fetch_time, "銘柄": ticker, "名称": name,
-                "価格": price, "分類": action, "理由": reason,
-                "損切": stop, "目標": target, "RR": rr_val,
-                "SMA50": sma50, "RSI": rsi, "乖離": c_dist, "ATR": atr
+                "Run_ID": run_id, "日本時間": now_jp.strftime('%Y-%m-%d %H:%M'),
+                "米国時間": now_ny.strftime('%Y-%m-%d %H:%M'), "データ最終日": last_date,
+                "銘柄": ticker, "名称": stock.info.get('shortName', ticker), "現在値": price,
+                "結論": cat, "判定理由": reason, "次の行動": step,
+                "損切り": stop_price, "目標": target_price, "RR": rr_val,
+                "SMA50": sma50, "RSI": rsi, "ATR": atr, "距離": dist_sma
             })
-        except: continue
+        except Exception as e:
+            results.append({"銘柄": ticker, "結論": "エラー", "判定理由": "取得失敗", "次の行動": "再試行待ち"})
+            continue
+            
+    status_msg.empty()
+    progress_bar.empty()
     return pd.DataFrame(results)
 
-# --- 4. UI構築 (v1.0 固定仕様) ---
+# --- 3. UI 構築 (仕様 3, 4) ---
 
-st.sidebar.title("🦅 Navigator v1.0")
-page = st.sidebar.radio("機能", ["🚀 戦略ボード", "⚙️ 過去ログ・監査"])
+mode = st.sidebar.radio("機能メニュー", ["🚀 戦略ボード", "⚙️ 過去ログ・分析室"])
 
-if page == "🚀 戦略ボード":
-    st.title("🦅 Market Edge Pro v1.0")
-    st.caption(f"仕様: SMA{SPEC['SMA_PERIOD']} / R/R ≧ {SPEC['RR_THRESHOLD']} / 損切 ATR×{SPEC['STOP_MULT']}")
+if mode == "🚀 戦略ボード":
+    st.title("🦅 Market Edge Pro")
+    
+    # ヘッダー情報 (仕様 4)
+    st.markdown(f"""
+    <div style="background-color:#f0f2f6; padding:10px; border-radius:5px; font-size:0.9em;">
+    <b>ルール:</b> 短期スイング（日足） | <b>対象:</b> 米国主要株 | <b>更新:</b> 市場をスキャンして結果を更新 ボタンを押してください
+    </div>
+    """, unsafe_allow_html=True)
 
-    if st.button("🔄 市場をスキャンして仕様を固定する", type="primary"):
-        df = analyze_market_v1(["NVDA", "MSFT", "AAPL", "AMZN", "GOOGL", "META", "TSLA", "AVGO", "AMD", "PLTR", "ARM", "SMCI", "COIN", "CRWD", "LLY", "NVO", "COST", "NFLX", "INTC"])
+    if st.button("🔄 市場をスキャンして結果を更新", type="primary"):
+        tickers = ["NVDA", "MSFT", "AAPL", "AMZN", "GOOGL", "META", "TSLA", "AVGO", "AMD", "PLTR", "CRWD", "LLY", "NFLX", "COST"]
+        df = fetch_and_analyze(tickers)
         if not df.empty:
-            st.session_state['v1_df'] = df
+            st.session_state['v1_data'] = df
+            # ログ保存
             if not os.path.exists(HISTORY_FILE): df.to_csv(HISTORY_FILE, index=False)
             else: df.to_csv(HISTORY_FILE, mode='a', header=False, index=False)
 
-    if 'v1_df' in st.session_state:
-        df = st.session_state['v1_df']
-        st.info(f"🕒 **基準時刻:** {df['スキャン時刻'].iloc[0]} | **ID:** {df['Run_ID'].iloc[0]}")
+    if 'v1_data' in st.session_state:
+        df = st.session_state['v1_data']
+        r = df.iloc[0]
+        st.caption(f"🕒 更新(日本): {r['日本時間']} | 更新(現地): {r['米国時間']} | データ末尾: {r['データ最終日']} | ID: {r['Run_ID']}")
         
-        # カテゴリ表示 (一貫性の担保)
-        tabs = st.tabs(["✅ 買い候補", "⏳ 監視・待機", "🗑️ 除外"])
-        
-        with tabs[0]:
-            target_df = df[df['分類']=="買い候補"]
-            if not target_df.empty:
-                for _, r in target_df.iterrows():
-                    with st.expander(f"**{r['銘柄']}** | R/R {r['RR']:.2f}x | {r['理由']}", expanded=True):
-                        c = st.columns(4)
-                        c[0].metric("現在値", f"${r['価格']:.2f}")
-                        c[1].metric("損切(撤退)", f"${r['損切']:.2f}", f"{(r['損切']-r['価格'])/r['価格']:.1%}")
-                        c[2].metric("目標(短期)", f"${r['目標']:.2f}", f"{(r['目標']-r['価格'])/r['価格']:.1%}")
-                        c[3].metric("利幅/損幅比", f"{r['RR']:.2f}x")
-            else: st.write("現在、仕様を満たす候補はありません。")
+        counts = df['結論'].value_counts()
+        st.markdown(f"**診断結果:** 検討中 {len(df)} 銘柄中 ➔ ✅検討:{counts.get(LBL['ACTION_NOW'],0)} / ⏳待機:{counts.get(LBL['WATCH'],0)} / 🗑️対象外:{counts.get(LBL['EXCLUDE'],0)}")
 
-        with tabs[1]:
-            st.dataframe(df[df['分類'].isin(["監視", "待機"])][["銘柄", "分類", "理由", "価格", "RR"]])
+        t1, t2, t3 = st.tabs([f"✅ {LBL['ACTION_NOW']}", f"⏳ {LBL['WATCH']}", f"🗑️ {LBL['EXCLUDE']}"])
 
-        with tabs[2]:
-            st.dataframe(df[df['分類']=="除外"][["銘柄", "理由"]])
+        with t1:
+            target = df[df['結論']==LBL['ACTION_NOW']]
+            if target.empty: st.info("現在、条件を満たす銘柄はありません。")
+            for _, row in target.iterrows():
+                with st.container():
+                    col1, col2 = st.columns([3, 1])
+                    with col1: st.subheader(f"{row['銘柄']} : {row['名称']}")
+                    with col2: st.metric("利得損失比(R/R)", f"{row['RR']}x")
+                    
+                    c = st.columns(4)
+                    c[0].metric("現在値", f"${row['現在値']:.2f}")
+                    c[1].metric("損切り", f"${row['損切り']:.2f}", f"{(row['損切り']-row['現在値'])/row['現在値']:.1%}")
+                    c[2].metric("目標", f"${row['目標']:.2f}", f"{(row['目標']-row['現在値'])/row['現在値']:.1%}")
+                    c[3].write(f"📌 **次の一手:**\n{row['次の行動']}")
+                    
+                    with st.expander("📊 根拠・詳細データ (クリックで開く)"):
+                        st.markdown(f"""
+                        - **RSI (過熱感):** {row['RSI']:.1f} （70以上は買われすぎ）
+                        - **SMA50 (50日線):** ${row['SMA50']:.2f} （これより上で上昇中が条件）
+                        - **SMA乖離率:** {row['距離']*100:.1f}% （5%以内の押し目を狙う）
+                        - **ATR (平均値幅):** ${row['ATR']:.2f} （1日の平均的な値動き幅）
+                        - **判定理由:** {row['判定理由']}
+                        """)
+                    st.divider()
+
+        with t2:
+            st.caption("定義: トレンドは良いが、価格が高すぎるか期待値が届かない銘柄です。")
+            st.dataframe(df[df['結論']==LBL['WATCH']][["銘柄", "判定理由", "次の行動", "現在値", "SMA50", "RR"]], hide_index=True)
+
+        with t3:
+            st.caption("定義: 下落トレンド、またはボラティリティ過多でルールに適合しません。")
+            st.dataframe(df[df['結論']==LBL['EXCLUDE']][["銘柄", "判定理由", "次の行動"]], hide_index=True)
+
+    st.divider()
+    st.caption("⚠️ 免責事項: 本アプリは設定されたルールに基づく計算結果を表示するツールであり、投資助言ではありません。最終的な投資判断は必ずご自身の責任で行ってください。")
 
 else:
     st.title("⚙️ 過去ログ・分析室")
     if os.path.exists(HISTORY_FILE):
-        hist_df = pd.read_csv(HISTORY_FILE)
-        st.dataframe(hist_df.sort_index(ascending=False), use_container_width=True)
-        st.caption(f"Verification Code: {get_verification_code()}")
+        log_df = pd.read_csv(HISTORY_FILE)
+        st.write("### 実行履歴 (Run単位)")
+        run_summary = log_df.groupby('Run_ID').agg({'日本時間':'first', '銘柄':'count', 'データ最終日':'first'}).sort_index(ascending=False)
+        st.dataframe(run_summary, use_container_width=True)
+        
+        st.write("### 詳細ログ (銘柄単位)")
+        st.dataframe(log_df.sort_index(ascending=False), hide_index=True)
+    else:
+        st.info("まだ実行履歴がありません。")
