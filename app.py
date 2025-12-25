@@ -13,7 +13,7 @@ st.set_page_config(page_title="Market Edge Pro", page_icon="🦅", layout="wide"
 
 # 定数
 HISTORY_FILE = "master_execution_log.csv"
-PROTOCOL_VER = "v18.0_Consistent_Logic"
+PROTOCOL_VER = "v19.0_Zero_Contradiction"
 MIN_INTERVAL_DAYS = 7       
 MAX_SPREAD_TOLERANCE = 0.8  
 PORTFOLIO_SIZE = 5
@@ -50,7 +50,7 @@ def get_last_execution_time():
 def decay_function(spread):
     return 1.0 / (1.0 + spread)
 
-# --- 3. 分析エンジン (矛盾排除ロジック) ---
+# --- 3. 分析エンジン (矛盾ゼロ・ロジック) ---
 
 @st.cache_data(ttl=3600)
 def fetch_market_data(tickers):
@@ -58,7 +58,7 @@ def fetch_market_data(tickers):
     run_id = str(uuid.uuid4())[:8]
     fetch_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     
-    with st.spinner("🦅 データ整合性チェック・分析中..."):
+    with st.spinner("🦅 厳格スキャン実行中... (Trend check, Logic verification)"):
         for i, ticker in enumerate(tickers):
             try:
                 stock = yf.Ticker(ticker)
@@ -73,13 +73,23 @@ def fetch_market_data(tickers):
                 name = info.get('shortName', ticker)
                 sector = info.get('sector', 'Unknown')
                 
-                # --- 1. 割安性 (Valuation) ---
+                # --- A. トレンド判定 (絶対基準) ---
+                # SMA50を「生命線」とする。これを割っていたら上昇トレンドとは呼ばない。
+                sma50 = hist['Close'].rolling(window=50).mean().iloc[-1]
+                sma200 = hist['Close'].rolling(window=200).mean().iloc[-1] if len(hist) > 200 else sma50
+                
+                # ロジック: 価格がSMA50の上にあるか？
+                is_above_sma50 = price >= sma50
+                trend_status = "上昇中" if is_above_sma50 else "調整/下降"
+                
+                # --- B. 割安性 (根拠の明示) ---
                 peg = info.get('pegRatio')
                 fwd_pe = info.get('forwardPE')
                 growth = info.get('earningsGrowth')
                 
-                val_score = 0
-                val_msg = "データなし"
+                val_status = "不明"
+                val_detail = "データなし"
+                is_undervalued = False
                 
                 est_peg = None
                 if peg is not None: est_peg = peg
@@ -88,97 +98,84 @@ def fetch_market_data(tickers):
                     except: pass
                 
                 if est_peg is not None:
-                    if est_peg < 1.0: val_score = 30; val_msg = "超割安"
-                    elif est_peg < 1.5: val_score = 20; val_msg = "割安"
-                    elif est_peg < 2.0: val_score = 10; val_msg = "適正"
-                    else: val_msg = "割高"
+                    if est_peg < 1.5: 
+                        val_status = "割安"
+                        val_detail = f"PEG {est_peg:.2f} < 1.5"
+                        is_undervalued = True
+                    elif est_peg < 2.0: 
+                        val_status = "適正"
+                        val_detail = f"PEG {est_peg:.2f} (適正圏)"
+                        is_undervalued = True
+                    else: 
+                        val_status = "割高"
+                        val_detail = f"PEG {est_peg:.2f} > 2.0"
                 elif fwd_pe is not None:
-                    if fwd_pe < 20: val_score = 20; val_msg = "PER割安"
-                    else: val_msg = "PER評価"
+                    if fwd_pe < 25: 
+                        val_status = "PER割安"
+                        val_detail = f"PER {fwd_pe:.1f} < 25"
+                        is_undervalued = True
+                    else:
+                        val_status = "PER割高"
+                        val_detail = f"PER {fwd_pe:.1f}"
 
-                # --- 2. トレンド (Trend) - 厳格化 ---
-                sma50 = hist['Close'].rolling(window=50).mean().iloc[-1]
-                sma200 = hist['Close'].rolling(window=200).mean().iloc[-1] if len(hist) > 200 else price
-                
-                trend_score = 0
-                trend_msg = "下降/レンジ"
-                is_uptrend = False
-                
-                if price > sma50 > sma200: 
-                    trend_score = 30
-                    trend_msg = "上昇トレンド"
-                    is_uptrend = True
-                elif price > sma50: 
-                    trend_score = 15
-                    trend_msg = "短期上昇"
-                    is_uptrend = True
-                
-                # --- 3. 需給・リスク ---
+                # --- C. リスク・需給 ---
                 target_mean = info.get('targetMeanPrice', price)
                 upside = (target_mean - price) / price
                 
                 target_high = info.get('targetHighPrice', target_mean)
                 target_low = info.get('targetLowPrice', target_mean)
-                spread = (target_high - target_low) / target_mean if target_mean else 0.5
-                
+                spread = (target_high - target_low) / target_mean if target_mean else 0.0
                 analysts = info.get('numberOfAnalystOpinions', 0)
-                conf_factor = min(1.0, analysts / 15.0) if analysts >= 3 else 0.0
                 
                 # 安全弁
-                safety_status = "OK"
-                reject_reason = ""
+                is_safe = True
+                safety_msg = "OK"
                 if spread > MAX_SPREAD_TOLERANCE: 
-                    safety_status = "REJECT"
-                    reject_reason = "変動リスク過大"
+                    is_safe = False
+                    safety_msg = f"除外: 値動き過大 (Spread {spread:.1%})"
                 elif analysts < 3: 
-                    safety_status = "REJECT"
-                    reject_reason = "情報不足"
+                    is_safe = False
+                    safety_msg = f"除外: 情報不足 (Analysts {analysts})"
                 
-                cons_score = 0
-                if upside > 0:
-                    base = 20 if upside > 0.2 else (10 if upside > 0.1 else 0)
-                    cons_score = int(base * decay_function(spread) * conf_factor)
-                
-                total_score = val_score + trend_score + cons_score
-                
-                # --- 4. タイミング & 損切り ---
+                # --- D. タイミング & 損切り ---
                 delta = hist['Close'].diff()
                 gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
                 loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
                 rs = gain / loss
                 rsi = 100 - (100 / (1 + rs)).iloc[-1]
                 
-                # 損切りライン (矛盾回避: 必ず現在値より下にする)
-                # SMA50の-3% と 現在値の-7% のうち、低い方（遠い方）を採用
-                stop_loss_sma = sma50 * 0.97
-                stop_loss_vol = price * 0.93
-                stop_loss = min(stop_loss_sma, stop_loss_vol)
+                # 損切りライン (ロジック固定: SMA50の-3%)
+                # 理由: トレンドフォローなので、トレンドライン(SMA50)を明確に割ったら前提崩れで撤退
+                stop_loss = sma50 * 0.97
                 
-                # Action判定
-                dist_to_sma = (price - sma50) / price
+                # 乖離率
+                dist_sma = (price - sma50) / sma50
                 
-                action = "待機" 
-                # 理由は動的に生成して矛盾を防ぐ
-                reason_dynamic = f"{trend_msg}かつ{val_msg}"
+                # --- 最終判定 (Logic Tree) ---
+                action = "WAIT"
+                reason = "ー"
                 
-                if safety_status == "REJECT":
-                    action = "除外"
-                    reason_dynamic = reject_reason
-                elif not is_uptrend:
-                    # トレンドが悪いなら、スコアが高くても「待機」
-                    action = "待機"
-                    reason_dynamic = "トレンド弱含み"
-                elif total_score >= 40:
-                    if dist_to_sma < 0.08 and rsi < 75: 
-                        action = "候補"
-                    elif dist_to_sma >= 0.08 or rsi >= 75:
-                        action = "監視"
-                        reason_dynamic = "過熱感あり"
-                    else:
-                        action = "待機"
+                if not is_safe:
+                    action = "AVOID"
+                    reason = safety_msg
+                elif not is_above_sma50:
+                    action = "WAIT"
+                    reason = f"トレンド弱含み (現在値 ${price:.2f} < SMA50 ${sma50:.2f})"
+                elif not is_undervalued:
+                    action = "WAIT"
+                    reason = f"割安感なし ({val_status})"
                 else:
-                    action = "待機"
-                    reason_dynamic = "スコア不足"
+                    # ここまで来たら「安全」「上昇中」「割安」
+                    # あとはタイミングのみ
+                    if dist_sma < 0.05 and rsi < 70:
+                        action = "ENTRY"
+                        reason = f"★ 押し目好機 (乖離 {dist_sma:.1%} / RSI {rsi:.0f})"
+                    elif dist_sma >= 0.05 or rsi >= 70:
+                        action = "WATCH"
+                        reason = f"過熱感あり (乖離 {dist_sma:.1%} / RSI {rsi:.0f})"
+                    else:
+                        action = "WAIT"
+                        reason = "モメンタム不足"
 
                 data_list.append({
                     "Run_ID": run_id,
@@ -186,15 +183,17 @@ def fetch_market_data(tickers):
                     "Ticker": ticker,
                     "Name": name,
                     "Price": price,
-                    "Total_Score": total_score,
                     "Action": action, 
-                    "Reason": reason_dynamic, # 動的理由
-                    "Val_Msg": val_msg,
-                    "Trend_Msg": trend_msg,
-                    "Buy_Level": sma50, 
+                    "Reason": reason,
+                    "Val_Detail": val_detail,
+                    "Trend_Status": trend_status,
+                    "SMA50": sma50, 
                     "Stop_Loss": stop_loss, 
                     "RSI": rsi,
-                    "Dist_SMA": dist_to_sma
+                    "Dist_SMA": dist_sma,
+                    "Spread": spread,
+                    "Upside": upside,
+                    "Target": target_mean
                 })
             except: continue
             
@@ -213,7 +212,8 @@ def log_execution(df_candidates):
     df_save["Prev_Hash"] = prev_hash
     df_save["Note"] = note
     
-    content = df_save[['Run_ID', 'Ticker', 'Total_Score', 'Scan_Time']].to_string()
+    # 簡略化してハッシュ計算
+    content = df_save[['Run_ID', 'Ticker', 'Action', 'Scan_Time']].to_string()
     new_hash = calculate_chain_hash(prev_hash, content)
     df_save["Record_Hash"] = new_hash
     
@@ -224,32 +224,32 @@ def log_execution(df_candidates):
     
     return note == "Practice"
 
-# --- 4. UI構築 (誠実な表示) ---
+# --- 4. UI構築 (シンプル・整合性重視) ---
 
 st.sidebar.title("メニュー")
-mode = st.sidebar.radio("モード切替", ["🚀 候補仕分け (表)", "⚙️ 記録・監査 (裏)"])
+mode = st.sidebar.radio("モード切替", ["🚀 朝の点検 (スキャン)", "⚙️ 記録・監査 (ログ)"])
 
 TARGETS = ["NVDA", "MSFT", "AAPL", "AMZN", "GOOGL", "META", "TSLA", "AVGO", "AMD", "PLTR", "ARM", "SMCI", "COIN", "CRWD", "LLY", "NVO", "COST", "NFLX", "INTC"]
 
-if mode == "🚀 候補仕分け (表)":
+if mode == "🚀 朝の点検 (スキャン)":
     st.title("🦅 Market Edge Pro")
-    st.caption("「今日見るべき銘柄」を10秒で仕分けるためのツール")
+    st.caption("【短期スイング用】上昇トレンドの押し目銘柄を検知します。")
     
-    if st.button("🔄 市場をチェックする", type="primary"):
+    if st.button("🔄 市場を点検する", type="primary"):
         df = fetch_market_data(TARGETS)
         
         if not df.empty:
             log_execution(df)
             
             scan_time = df['Scan_Time'].iloc[0]
-            st.caption(f"🕒 データ基準時刻: {scan_time}")
+            st.caption(f"🕒 データ基準: {scan_time}")
 
-            # --- 1. 候補 (Actionable) ---
-            entries = df[df['Action'] == "候補"].sort_values('Dist_SMA', ascending=True)
+            # --- 1. 候補 (ENTRY) ---
+            entries = df[df['Action'] == "ENTRY"].sort_values('Dist_SMA', ascending=True)
             
-            st.header(f"1. 本日の注目候補 ({len(entries)}銘柄)")
+            st.header(f"✅ 候補リスト ({len(entries)}銘柄)")
             if not entries.empty:
-                st.info("以下の銘柄は「上昇トレンド」かつ「基準価格付近」にあります。詳細を確認してください。")
+                st.info("条件：上昇トレンド維持 + 割安圏 + 押し目水準 (SMA50付近)")
                 for _, row in entries.iterrows():
                     with st.container():
                         c1, c2, c3 = st.columns([1.5, 2, 2])
@@ -260,50 +260,44 @@ if mode == "🚀 候補仕分け (表)":
                             st.write(f"現在値: **${row['Price']:.2f}**")
                             # 乖離率
                             diff = row['Dist_SMA']
-                            diff_color = "red" if diff < 0 else "green"
-                            st.write(f"基準乖離: :{diff_color}[{diff:+.1%}]")
+                            st.write(f"SMA50乖離: **{diff:+.1%}**")
                         with c3:
-                            st.write(f"✅ **判定:** {row['Reason']}")
+                            st.success(f"{row['Reason']}")
                         
-                        # 根拠と確認ポイント
+                        # 根拠とプラン
                         c_act1, c_act2 = st.columns(2)
-                        c_act1.success(f"🎯 **基準価格(SMA50):** ${row['Buy_Level']:.2f} 付近")
-                        c_act2.error(f"🛑 **防衛ライン:** ${row['Stop_Loss']:.2f} 割れ")
+                        c_act1.write(f"📈 **トレンド基準(SMA50):** ${row['SMA50']:.2f}")
+                        c_act2.error(f"🛑 **撤退ライン:** ${row['Stop_Loss']:.2f} (SMA50の-3%)")
                         
-                        with st.expander("⚠️ エントリー前の確認ポイント"):
-                            st.markdown("""
-                            * **決算発表:** 直近1週間以内に決算がありませんか？
-                            * **ニュース:** 突発的な悪材料が出ていませんか？
-                            * **地合い:** 全体相場(QQQ/SPY)は暴落していませんか？
-                            """)
-                            st.divider()
-                            st.write(f"・トレンド: {row['Trend_Msg']}")
-                            st.write(f"・割安度: {row['Val_Msg']}")
-                            st.write(f"・過熱感(RSI): {row['RSI']:.1f}")
+                        with st.expander("詳細判定ロジックを見る"):
+                            st.write(f"1. トレンド: {row['Trend_Status']} (Price ${row['Price']:.2f} >= SMA ${row['SMA50']:.2f})")
+                            st.write(f"2. 割安度: {row['Val_Detail']}")
+                            st.write(f"3. 過熱感: RSI {row['RSI']:.1f} (70以下OK)")
+                            st.write(f"4. 目標株価: ${row['Target']:.2f} (Upside {row['Upside']:.1%})")
                         st.divider()
             else:
-                st.write("現在、条件を満たす「注目候補」はありません。")
+                st.write("現在、条件（トレンド・割安・押し目）を全て満たす銘柄はありません。")
 
-            # --- 2. 監視 (Watch) ---
-            watches = df[df['Action'] == "監視"].sort_values('Dist_SMA', ascending=True)
+            # --- 2. 監視 (WATCH) ---
+            watches = df[df['Action'] == "WATCH"].sort_values('Dist_SMA', ascending=True)
             
-            st.header(f"2. 監視リスト ({len(watches)}銘柄)")
+            st.header(f"👀 監視リスト ({len(watches)}銘柄)")
             if not watches.empty:
-                st.caption("トレンドは良好ですが、過熱感があるか価格が高すぎます。")
+                st.caption("トレンド・割安度は良好ですが、価格が高すぎます。調整を待ちます。")
                 for _, row in watches.iterrows():
-                    with st.expander(f"👀 **{row['Ticker']}** (${row['Price']:.2f}) -> 調整待ち"):
-                        st.warning(f"⏰ **待機条件:** 株価が **${row['Buy_Level']:.2f}** 付近まで調整したら確認")
-                        st.write(f"判定: {row['Reason']}")
+                    with st.expander(f"{row['Ticker']} (${row['Price']:.2f}) -> {row['Reason']}"):
+                        st.warning(f"⏰ **待機:** 株価が **${row['SMA50']:.2f}** 付近まで落ちてきたら再確認")
+                        st.write(f"乖離率: {row['Dist_SMA']:+.1%} / RSI: {row['RSI']:.0f}")
             else:
                 st.write("監視対象はありません。")
 
-            # --- 3. 除外 (Excluded) ---
-            waits = df[df['Action'].isin(["除外", "待機"])]
-            with st.expander(f"🗑️ 除外・対象外 ({len(waits)}銘柄)"):
-                st.dataframe(waits[['Ticker', 'Action', 'Reason']])
+            # --- 3. 対象外 (AVOID/WAIT) ---
+            waits = df[df['Action'].isin(["AVOID", "WAIT"])]
+            with st.expander(f"🗑️ 対象外・除外 ({len(waits)}銘柄)"):
+                st.dataframe(waits[['Ticker', 'Action', 'Reason', 'Trend_Status']])
                 
             st.markdown("---")
-            st.caption("※ 本ツールは投資判断の補助を行うものであり、利益を保証するものではありません。最終判断はご自身の責任で行ってください。")
+            st.caption("※ 本ツールは「短期スイング（数週間）」を想定した判断補助ツールです。最終売買はご自身の責任で行ってください。")
                 
         else:
             st.error("データ取得エラー")
@@ -318,6 +312,7 @@ else:
         st.subheader("📊 実行サマリー")
         last_run = hist_df.iloc[-1]
         st.write(f"最終実行: {last_run['Scan_Time']}")
+        st.write(f"総記録数: {len(hist_df)}件")
         
         st.divider()
         st.subheader("📜 実行ログ (Raw)")
