@@ -13,13 +13,13 @@ st.set_page_config(page_title="Market Edge Pro", page_icon="🦅", layout="wide"
 
 # ファイル・パラメータ定数
 HISTORY_FILE = "master_execution_log.csv"
-PROTOCOL_VER = "v14.0_Action_First"
+PROTOCOL_VER = "v15.0_Robust_Data"
 MIN_INTERVAL_DAYS = 7       
 MAX_SPREAD_TOLERANCE = 0.8  
 PORTFOLIO_SIZE = 5
 MAX_SECTOR_ALLOCATION = 2
 
-# --- 2. 裏方ロジック (監査・計算) ---
+# --- 2. 裏方ロジック ---
 
 def get_verification_code():
     if not os.path.exists(HISTORY_FILE): return "NO_DATA"
@@ -50,7 +50,7 @@ def get_last_execution_time():
 def decay_function(spread):
     return 1.0 / (1.0 + spread)
 
-# --- 3. 分析エンジン (ロジック) ---
+# --- 3. 分析エンジン (ロジック強化版) ---
 
 @st.cache_data(ttl=3600)
 def fetch_market_data(tickers):
@@ -58,7 +58,7 @@ def fetch_market_data(tickers):
     run_id = str(uuid.uuid4())[:8]
     fetch_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     
-    with st.spinner("🦅 市場をスキャン中..."):
+    with st.spinner("🦅 データ補完・詳細分析を実行中..."):
         for i, ticker in enumerate(tickers):
             try:
                 stock = yf.Ticker(ticker)
@@ -73,18 +73,46 @@ def fetch_market_data(tickers):
                 name = info.get('shortName', ticker)
                 sector = info.get('sector', 'Unknown')
                 
-                # 1. 割安性 (Valuation)
-                peg = info.get('pegRatio', np.nan)
+                # --- 1. 割安性 (Valuation) : 3段構えの判定 ---
+                peg = info.get('pegRatio')
+                fwd_pe = info.get('forwardPE')
+                growth = info.get('earningsGrowth')
+                
                 val_score = 0
-                val_msg = "判定不可"
+                val_msg = "データ不足"
+                used_metric = "None"
+                metric_val = 0.0
+
+                # Plan A: 公式PEG
+                if peg is not None:
+                    used_metric = "PEG"
+                    metric_val = peg
                 
-                if pd.notna(peg):
-                    if peg < 1.0: val_score = 30; val_msg = "S (超割安)"
-                    elif peg < 1.5: val_score = 20; val_msg = "A (割安)"
-                    elif peg < 2.0: val_score = 10; val_msg = "B (適正)"
-                    else: val_msg = "C (割高圏)"
+                # Plan B: 推定PEG (PE / Growth)
+                elif fwd_pe is not None and growth is not None and growth > 0:
+                    try:
+                        # growthは通常0.15(=15%)のように返ってくる
+                        est_peg = fwd_pe / (growth * 100) 
+                        used_metric = "PEG(est)"
+                        metric_val = est_peg
+                    except: pass
                 
-                # 2. トレンド (Trend)
+                # 判定ロジック (PEG基準)
+                if used_metric.startswith("PEG"):
+                    if metric_val < 1.0: val_score = 30; val_msg = f"S (超割安 {used_metric}:{metric_val:.2f})"
+                    elif metric_val < 1.5: val_score = 20; val_msg = f"A (割安 {used_metric}:{metric_val:.2f})"
+                    elif metric_val < 2.0: val_score = 10; val_msg = f"B (適正 {used_metric}:{metric_val:.2f})"
+                    else: val_msg = f"C (割高圏 {used_metric}:{metric_val:.2f})"
+                
+                # Plan C: 予想PER単体評価 (最終手段)
+                elif fwd_pe is not None:
+                    used_metric = "PER"
+                    metric_val = fwd_pe
+                    if fwd_pe < 20: val_score = 20; val_msg = f"A (PER:{fwd_pe:.1f})"
+                    elif fwd_pe < 35: val_score = 10; val_msg = f"B (PER:{fwd_pe:.1f})"
+                    else: val_msg = f"C (PER:{fwd_pe:.1f})"
+
+                # --- 2. トレンド (Trend) ---
                 sma50 = hist['Close'].rolling(window=50).mean().iloc[-1]
                 sma200 = hist['Close'].rolling(window=200).mean().iloc[-1] if len(hist) > 200 else price
                 
@@ -93,9 +121,12 @@ def fetch_market_data(tickers):
                 if price > sma50 > sma200: trend_score = 30; trend_msg = "S (上昇トレンド)"
                 elif price > sma50: trend_score = 15; trend_msg = "A (短期上昇)"
                 
-                # 3. 需給・期待 (Consensus)
+                # --- 3. 需給・期待 (Consensus) ---
                 target_mean = info.get('targetMeanPrice', 0)
-                upside = (target_mean - price) / price if target_mean else 0
+                # ターゲットがない場合は現在値をターゲットと仮定して加点なしにする
+                if not target_mean: target_mean = price
+                    
+                upside = (target_mean - price) / price
                 
                 target_high = info.get('targetHighPrice', target_mean)
                 target_low = info.get('targetLowPrice', target_mean)
@@ -116,29 +147,28 @@ def fetch_market_data(tickers):
                 
                 total_score = val_score + trend_score + cons_score
                 
-                # 4. タイミング (RSI) & Action
+                # --- 4. タイミング (RSI) & Action ---
                 delta = hist['Close'].diff()
                 gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
                 loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
                 rs = gain / loss
                 rsi = 100 - (100 / (1 + rs)).iloc[-1]
                 
-                # --- 結論（Action）の判定 ---
-                # SMA50との乖離
+                # Action判定
                 dist_to_sma = (price - sma50) / price
                 
-                action = "WAIT" # デフォルト
+                action = "WAIT" 
                 
                 if safety_status != "OK":
-                    action = "AVOID" # 除外
-                elif total_score >= 50:
-                    # スコア良し。タイミングは？
-                    if -0.03 < dist_to_sma < 0.05 and rsi < 70:
-                        action = "ENTRY" # 押し目かつ過熱なし
-                    elif dist_to_sma >= 0.05 or rsi >= 70:
-                        action = "WATCH" # 良いが高すぎる
+                    action = "AVOID"
+                elif total_score >= 40: # 合格ラインを50→40に緩和（現実的なライン）
+                    # スコア良し。タイミング判定
+                    if dist_to_sma < 0.08 and rsi < 75: # 乖離8%以内なら許容
+                        action = "ENTRY"
+                    elif dist_to_sma >= 0.08 or rsi >= 75:
+                        action = "WATCH" # 高すぎる
                     else:
-                        action = "WAIT" # まだ弱い
+                        action = "WAIT"
                 else:
                     action = "WAIT" # スコア不足
 
@@ -150,7 +180,7 @@ def fetch_market_data(tickers):
                     "Sector": sector,
                     "Price": price,
                     "Total_Score": total_score,
-                    "Action": action, # 結論
+                    "Action": action, 
                     "Filter_Status": safety_status,
                     "Val_Msg": val_msg,
                     "Trend_Msg": trend_msg,
@@ -165,7 +195,6 @@ def fetch_market_data(tickers):
     return pd.DataFrame(data_list)
 
 def log_execution(df_candidates):
-    """実行ログ保存（裏方）"""
     prev_hash = get_last_hash()
     last_time = get_last_execution_time()
     current_time = pd.to_datetime(df_candidates['Scan_Time'].iloc[0])
@@ -189,15 +218,13 @@ def log_execution(df_candidates):
     
     return note == "Practice"
 
-# --- 4. UI構築 (表: シンプル / 裏: 玄人) ---
+# --- 4. UI構築 ---
 
-# タブではなくサイドバーで完全に世界を分ける
 st.sidebar.title("🦅 Menu")
 mode = st.sidebar.radio("モード", ["🚀 市場スキャナー (判断)", "⚙️ 管理室 (記録・監査)"])
 
 TARGETS = ["NVDA", "MSFT", "AAPL", "AMZN", "GOOGL", "META", "TSLA", "AVGO", "AMD", "PLTR", "ARM", "SMCI", "COIN", "CRWD", "LLY", "NVO", "COST", "NFLX", "INTC"]
 
-# === 表の顔：判断支援 ===
 if mode == "🚀 市場スキャナー (判断)":
     st.title("🦅 Market Edge Pro")
     st.caption("今日の「入るべき」と「待つべき」を即座に判断します。")
@@ -206,24 +233,22 @@ if mode == "🚀 市場スキャナー (判断)":
         df = fetch_market_data(TARGETS)
         
         if not df.empty:
-            # ログ保存 (裏でひっそりと)
             is_practice = log_execution(df)
             if is_practice:
                 st.toast("練習モードで記録しました", icon="ℹ️")
             else:
                 st.toast("公式記録として保存しました", icon="💾")
 
-            # --- 結論ファーストで表示 ---
+            # --- 結論ファースト ---
             
-            # 1. ENTRY (今がチャンス)
+            # 1. ENTRY
             entries = df[df['Action'] == "ENTRY"].sort_values('Total_Score', ascending=False)
             if not entries.empty:
                 st.subheader(f"🚀 今がチャンス ({len(entries)}銘柄)")
-                st.caption("ファンダメンタルズが良好で、押し目（適正価格帯）にある銘柄です。")
+                st.caption("ファンダメンタルズが良好で、価格帯も適正範囲内です。")
                 
                 for _, row in entries.iterrows():
                     with st.container():
-                        # カード風デザイン
                         st.markdown(f"#### **{row['Ticker']}** : {row['Name']}")
                         c1, c2, c3 = st.columns([2, 2, 1])
                         
@@ -233,35 +258,33 @@ if mode == "🚀 市場スキャナー (判断)":
                         
                         with c2:
                             st.metric("現在株価", f"${row['Price']:.2f}")
-                            st.write(f"**買い目安:** ${row['Buy_Zone']:.2f} 付近")
+                            st.write(f"**目安ゾーン(SMA50):** ${row['Buy_Zone']:.2f} 付近")
                             
                         with c3:
                             st.metric("スコア", f"{row['Total_Score']}")
                         
                         st.divider()
 
-            # 2. WATCH (良いが高い)
+            # 2. WATCH
             watches = df[df['Action'] == "WATCH"].sort_values('Total_Score', ascending=False)
             if not watches.empty:
                 st.subheader(f"👀 監視リスト ({len(watches)}銘柄)")
-                st.caption("モノは良いですが、少し過熱気味です。押し目を待ちましょう。")
+                st.caption("良い銘柄ですが、少し加熱しています。押し目を待ちましょう。")
                 
                 for _, row in watches.iterrows():
                     with st.expander(f"**{row['Ticker']}** (${row['Price']:.2f}) - 調整待ち"):
-                        st.info(f"現在値 ${row['Price']:.2f} は、目安の ${row['Buy_Zone']:.2f} から離れています。")
-                        st.write(f"RSI: {row['RSI']:.1f} (70以上は過熱)")
+                        st.info(f"目安の ${row['Buy_Zone']:.2f} から離れています。")
+                        st.write(f"RSI: {row['RSI']:.1f}")
                         st.write(f"総合スコア: {row['Total_Score']}")
 
-            # 3. WAIT/AVOID (今はパス)
+            # 3. WAIT/AVOID
             waits = df[df['Action'].isin(["WAIT", "AVOID"])]
             with st.expander(f"✋ 対象外・様子見 ({len(waits)}銘柄)"):
                 st.dataframe(waits[['Ticker', 'Action', 'Total_Score', 'Val_Msg', 'Trend_Msg']])
-                st.caption("スコア不足、またはリスク過多の銘柄です。")
                 
         else:
             st.error("データ取得エラー")
 
-# === 裏の顔：管理室 ===
 else:
     st.title("⚙️ 管理室 (Audit & Logs)")
     st.info("ここは運用記録の検証、ハッシュ確認、生データのエクスポートを行うエンジニア向けの画面です。")
@@ -269,17 +292,19 @@ else:
     tab1, tab2 = st.tabs(["📜 実行ログ", "🛡️ プロトコル定義"])
     
     with tab1:
-        st.subheader("検証用ID (Verification Code)")
+        st.subheader("検証用ID")
         st.code(get_verification_code(), language="text")
-        st.caption("公開運用の際は、このコードを外部に記録してください。")
         
         st.divider()
         st.subheader("Raw Execution Log")
         if os.path.exists(HISTORY_FILE):
             hist_df = pd.read_csv(HISTORY_FILE)
+            if 'Violation' in hist_df.columns:
+                hist_df.rename(columns={'Violation': 'Note'}, inplace=True)
+            if 'Note' not in hist_df.columns:
+                hist_df['Note'] = "Legacy Data"
+                
             st.dataframe(hist_df.sort_index(ascending=False))
-            
-            # CSVダウンロード
             csv = hist_df.to_csv(index=False).encode('utf-8')
             st.download_button("📥 ログをCSVでダウンロード", csv, "market_edge_log.csv", "text/csv")
         else:
@@ -288,9 +313,7 @@ else:
     with tab2:
         st.subheader("System Constitution")
         st.code(f"""
-        Protocol Version: {PROTOCOL_VER}
-        Execution Interval: {MIN_INTERVAL_DAYS} days (Official)
-        Safety Valve (Max Spread): {MAX_SPREAD_TOLERANCE:.0%}
-        Portfolio Size: {PORTFOLIO_SIZE}
-        Sector Limit: {MAX_SECTOR_ALLOCATION}
+        Version: {PROTOCOL_VER}
+        Min Interval: {MIN_INTERVAL_DAYS} days
+        Max Risk (Spread): {MAX_SPREAD_TOLERANCE:.0%}
         """, language="yaml")
