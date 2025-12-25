@@ -12,7 +12,7 @@ import hashlib
 st.set_page_config(page_title="Market Edge Pro", page_icon="🦅", layout="wide")
 
 # ★ プロトコル定数 (裏側の憲法)
-PROTOCOL_VER = "v11.0_TwoLayer"
+PROTOCOL_VER = "v11.1_Compatibility_Fixed"
 HISTORY_FILE = "master_execution_log.csv"
 COST_RATE = 0.005          
 MIN_INTERVAL_DAYS = 7      
@@ -52,10 +52,6 @@ def get_last_hash():
 def decay_function(spread):
     return 1.0 / (1.0 + spread)
 
-def calculate_net_return(entry, exit, cost):
-    if entry == 0: return 0.0
-    return (exit / entry) * (1.0 - cost) - 1.0
-
 # --- 3. データ取得・分析ロジック ---
 
 @st.cache_data(ttl=3600)
@@ -64,7 +60,6 @@ def fetch_stock_data(tickers):
     run_id = str(uuid.uuid4())[:8]
     fetch_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     
-    # プログレスバーは「監査モード」以外では控えめに
     with st.spinner("🦅 市場データを分析中..."):
         for i, ticker in enumerate(tickers):
             try:
@@ -183,14 +178,13 @@ def save_to_history(df_portfolio):
     
     return df_save, violation
 
-# --- 4. 画面構築 (モード分岐) ---
+# --- 4. 画面構築 ---
 
-# サイドバーでモード切替
 mode = st.sidebar.radio("📱 モード選択", ["🚀 投資判断 (メイン)", "👮‍♂️ 監査・検証 (上級者)"])
 
 TARGETS = ["NVDA", "MSFT", "AAPL", "AMZN", "GOOGL", "META", "TSLA", "AVGO", "AMD", "PLTR", "ARM", "SMCI", "COIN", "CRWD", "LLY", "NVO", "COST", "NFLX", "INTC"]
 
-# === モード A: 投資判断 (シンプル・アクション重視) ===
+# === モード A: 投資判断 ===
 if mode == "🚀 投資判断 (メイン)":
     st.title("🦅 Market Edge Pro")
     st.caption("AIとアルゴリズムによる、客観的なポートフォリオ提案")
@@ -200,17 +194,14 @@ if mode == "🚀 投資判断 (メイン)":
     if st.button("🚀 候補銘柄をスキャンする", type="primary"):
         df = fetch_stock_data(TARGETS)
         if not df.empty:
-            portfolio, _ = build_portfolio(df)
+            portfolio = build_portfolio(df)
             
             if not portfolio.empty:
-                # 裏で保存 (ユーザーには見せない)
                 save_to_history(portfolio)
                 
-                # 結果表示
                 st.success("✅ 分析完了。以下の銘柄が抽出されました。")
                 st.markdown("### 📋 本日の推奨ポートフォリオ")
                 
-                # ユーザーフレンドリーなカラム名
                 display_df = portfolio[['Ticker', 'Sector', 'Price', 'Score', 'PEG']].copy()
                 display_df.columns = ['銘柄', 'セクター', '現在値($)', '総合スコア', '割安度(PEG)']
                 
@@ -221,7 +212,6 @@ if mode == "🚀 投資判断 (メイン)":
                     use_container_width=True
                 )
                 
-                # アクションプラン
                 st.divider()
                 st.subheader("⚡ 次のアクション")
                 st.warning(f"""
@@ -230,11 +220,11 @@ if mode == "🚀 投資判断 (メイン)":
                 3. 次回のチェックは **{MIN_INTERVAL_DAYS}日後** です。
                 """)
             else:
-                st.error("⚠️ 本日は基準を満たす安全な銘柄がありませんでした。ノーエントリーを推奨します。")
+                st.error("⚠️ 本日は基準を満たす安全な銘柄がありませんでした。")
         else:
             st.error("データ取得エラー。時間をおいて再試行してください。")
 
-# === モード B: 監査・検証 (プロ向け・複雑な詳細) ===
+# === モード B: 監査・検証 ===
 else:
     st.title("👮‍♂️ 監査・検証モード")
     st.caption("内部ログの健全性確認、改ざん検知、パフォーマンス分析")
@@ -246,7 +236,7 @@ else:
         anchor = get_integrity_anchor()
         if anchor != "NO_DATA":
             st.code(anchor, language="text")
-            st.caption("※このコードをSNS等に投稿することで、データの存在証明（タイムスタンプ）になります。")
+            st.caption("※このコードをSNS等に投稿することで、データの存在証明になります。")
         else:
             st.write("履歴データがありません。")
             
@@ -260,13 +250,29 @@ else:
 
     with tab2:
         st.subheader("確定損益の分析 (Closed Trades)")
+        
         if st.button("再集計を実行"):
             if os.path.exists(HISTORY_FILE):
                 hist = pd.read_csv(HISTORY_FILE)
-                # (簡易的な集計ロジックの表示)
-                # 実際にはここに詳細なバックテスト計算が入るが、UI分離のデモとして簡略化
-                valid_runs = hist[hist['Violation'].isna()].groupby('Run_ID').first()
-                st.metric("有効な実行回数", len(valid_runs))
-                st.info("詳細な資産曲線（Equity Curve）は、20営業日経過後にここに表示されます。")
+                
+                # --- ★ 自動互換処理 (過去ログ対応) ---
+                if 'Violation' not in hist.columns:
+                    if 'Status_Flag' in hist.columns:
+                        hist.rename(columns={'Status_Flag': 'Violation'}, inplace=True)
+                    else:
+                        hist['Violation'] = np.nan
+                # ------------------------------------
+                
+                # NaNも空文字として扱う
+                hist['Violation'] = hist['Violation'].fillna("")
+                
+                valid_runs = hist[hist['Violation'] == ""].groupby('Run_ID').first()
+                
+                if not valid_runs.empty:
+                    st.metric("有効な実行回数", len(valid_runs))
+                    st.info("詳細な資産曲線（Equity Curve）は、20営業日経過後にここに表示されます。")
+                    st.dataframe(valid_runs[['Scan_Time', 'Record_Hash']])
+                else:
+                    st.warning("有効な（違反のない）実行記録がまだありません。")
             else:
                 st.warning("履歴がありません。")
