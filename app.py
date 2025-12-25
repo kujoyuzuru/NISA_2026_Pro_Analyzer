@@ -9,52 +9,44 @@ import os
 import hashlib
 
 # --- 1. システム設定 & プロトコル定義 ---
-st.set_page_config(page_title="Market Edge Pro - Analytics", page_icon="🦅", layout="wide")
+st.set_page_config(page_title="Market Edge Pro - Integrity", page_icon="🦅", layout="wide")
 
-# ★ プロトコル定義 (ここを変えると Hash が変わり、別ルールとみなされる)
-PROTOCOL_DEF = """
-1. Universe: Specified Tech/Growth Tickers
-2. Selection: Hybrid Score (Decay Model)
-3. Portfolio: Top 5 Equal Weight
-4. Entry: Next Open / Exit: Entry + 20 Days Open
-5. Cost: 0.5% deducted at Exit
-6. Benchmark: QQQ (Price Return)
-"""
-PROTOCOL_HASH = hashlib.sha256(PROTOCOL_DEF.encode()).hexdigest()[:8]
-
-MODEL_VERSION = f"v7.0_Analytics_{PROTOCOL_HASH}"
+# プロトコル定義 (憲法)
+PROTOCOL_VER = "v8.0_Integrity_Audit"
+COST_RATE = 0.005 # 往復0.5% (Exit時に控除)
+HOLDING_DAYS = 20 # 営業日換算
 HISTORY_FILE = "master_execution_log.csv"
-COST_RATE = 0.005 # 0.5%
 
-# --- 2. 数理・ユーティリティ関数 ---
+# --- 2. 数理・セキュリティ関数 ---
 
-def get_last_hash():
+def get_file_integrity_hash():
+    """履歴ファイル全体のハッシュ(Commitment ID)を生成"""
     if not os.path.exists(HISTORY_FILE):
-        return "GENESIS"
-    try:
-        df = pd.read_csv(HISTORY_FILE)
-        if df.empty: return "GENESIS"
-        return df.iloc[-1]['Record_Hash']
-    except:
-        return "BROKEN"
+        return "NO_DATA"
+    with open(HISTORY_FILE, "rb") as f:
+        bytes = f.read()
+        return hashlib.sha256(bytes).hexdigest()[:16] # 16桁のショートコード
 
-def calculate_chain_hash(prev_hash, content_string):
-    combined = f"{prev_hash}|{content_string}"
+def calculate_row_hash(prev_hash, row_content):
+    """行ごとの連鎖ハッシュ"""
+    combined = f"{prev_hash}|{row_content}"
     return hashlib.sha256(combined.encode()).hexdigest()
 
 def decay_function(spread_val):
     return 1.0 / (1.0 + spread_val)
 
-@st.cache_data(ttl=3600)
-def fetch_market_context():
-    try:
-        bench = yf.Ticker("QQQ")
-        hist = bench.history(period="1d")
-        if not hist.empty:
-            return hist['Close'].iloc[-1]
-        return 0.0
-    except:
-        return 0.0
+def calculate_net_return(entry, exit, cost_rate):
+    """
+    厳格なリターン計算式
+    (Exit / Entry) * (1 - Cost) - 1
+    ※コストは資産取り崩しとして適用
+    """
+    if entry == 0: return 0.0
+    gross_return = exit / entry
+    net_return = gross_return * (1.0 - cost_rate) - 1.0
+    return net_return
+
+# --- 3. データ取得ロジック ---
 
 @st.cache_data(ttl=3600)
 def fetch_stock_data(tickers):
@@ -118,22 +110,16 @@ def fetch_stock_data(tickers):
                 
                 # Scoring
                 score = 0
-                
-                # 1. Valuation
                 if peg_type == "Official" and pd.notna(peg_val):
-                    base_points = 0
-                    if 0 < peg_val < 1.0: base_points = 30
-                    elif peg_val < 1.5: base_points = 20
-                    elif peg_val < 2.0: base_points = 10
-                    score += base_points
+                    if 0 < peg_val < 1.0: score += 30
+                    elif peg_val < 1.5: score += 20
+                    elif peg_val < 2.0: score += 10
                 
-                # 2. Trend
                 trend_ok = False
-                if len(hist) >= 200 and price > sma50 > sma200:
+                if len(hist) >= 5 and price > sma50 > sma200:
                     score += 30
                     trend_ok = True
                 
-                # 3. Upside
                 if upside_val > 0:
                     base_upside = 0
                     if upside_val > 0.2: base_upside = 20
@@ -143,9 +129,8 @@ def fetch_stock_data(tickers):
                         final_factor = spread_discount * conf_factor
                         score += int(base_upside * final_factor)
 
-                # 4. RSI (Simplified)
-                rsi = 50 
-
+                rsi = 50 # SImplified for speed
+                
                 grade = "C"
                 if score >= 80: grade = "S"
                 elif score >= 60: grade = "A"
@@ -159,9 +144,11 @@ def fetch_stock_data(tickers):
                     "Score": int(score),
                     "Price_At_Scan": price,
                     "PEG_Val": peg_val,
+                    "PEG_Type": peg_type,
                     "Spread": spread_val,
                     "Upside": upside_val,
-                    "Model_Ver": MODEL_VERSION
+                    "Data_Source": "yfinance_api",
+                    "Protocol_Ver": PROTOCOL_VER
                 })
             
             except Exception:
@@ -171,7 +158,7 @@ def fetch_stock_data(tickers):
     
     return pd.DataFrame(data_list)
 
-# --- 3. ポートフォリオ構築 ---
+# --- 4. ポートフォリオ構築 ---
 def build_portfolio(df):
     df_sorted = df.sort_values('Score', ascending=False)
     portfolio = []
@@ -191,18 +178,26 @@ def build_portfolio(df):
             
     return pd.DataFrame(portfolio), logs
 
-# --- 4. 履歴保存 ---
+# --- 5. 履歴保存 (Hash Chain) ---
 def save_to_history(df_portfolio):
-    prev_hash = get_last_hash()
+    # 前のハッシュを取得
+    if os.path.exists(HISTORY_FILE):
+        try:
+            prev_df = pd.read_csv(HISTORY_FILE)
+            prev_hash = prev_df.iloc[-1]['Record_Hash']
+        except:
+            prev_hash = "GENESIS"
+    else:
+        prev_hash = "GENESIS"
+    
     df_to_save = df_portfolio.copy()
     
     # メタデータ
-    df_to_save["Prev_Hash_Ref"] = prev_hash
-    df_to_save["Protocol_Hash"] = PROTOCOL_HASH
+    df_to_save["Prev_Hash"] = prev_hash
     
-    # ハッシュ生成
-    content_str = df_to_save[['Run_ID', 'Ticker', 'Score', 'Scan_Time']].to_string()
-    new_hash = calculate_chain_hash(prev_hash, content_str)
+    # 今回のハッシュ生成
+    content = df_to_save[['Run_ID', 'Ticker', 'Score', 'Scan_Time']].to_string()
+    new_hash = calculate_row_hash(prev_hash, content)
     df_to_save["Record_Hash"] = new_hash
     
     if not os.path.exists(HISTORY_FILE):
@@ -210,119 +205,121 @@ def save_to_history(df_portfolio):
     else:
         df_to_save.to_csv(HISTORY_FILE, mode='a', header=False, index=False)
     
-    return df_to_save, new_hash
+    return df_to_save
 
-# --- 5. 高度な分析機能 (Audit Analytics) ---
-def calculate_advanced_stats(df_history):
-    if df_history.empty: return None
+# --- 6. 監査機能 (Closed Trade Only) ---
+def audit_performance():
+    if not os.path.exists(HISTORY_FILE):
+        return None, None
 
-    run_ids = df_history['Run_ID'].unique()
-    performance_records = []
+    history = pd.read_csv(HISTORY_FILE)
+    if history.empty: return None, None
     
-    initial_equity = 10000.0
-    equity_curve = [initial_equity]
-    dates = [df_history['Scan_Time'].min().split(" ")[0]] # Start date
+    run_ids = history['Run_ID'].unique()
+    closed_trades = []
+    active_trades = []
     
-    qqq = yf.Ticker("QQQ")
+    progress = st.progress(0)
     
-    # 各Runの処理（簡易シミュレーション）
-    current_equity = initial_equity
-    
-    for rid in run_ids:
-        run_data = df_history[df_history['Run_ID'] == rid]
-        scan_date_str = run_data['Scan_Time'].iloc[0]
-        scan_date = pd.to_datetime(scan_date_str).date()
+    for i, rid in enumerate(run_ids):
+        run_data = history[history['Run_ID'] == rid]
+        scan_time = pd.to_datetime(run_data['Scan_Time'].iloc[0])
         
-        # 本来は翌日始値だが、簡易的に「Scan日の翌日～20日後」をシミュレート
-        start_date = scan_date + timedelta(days=1)
-        end_date = start_date + timedelta(days=30) # Approx 20 trading days
+        # プロトコル: EntryはScan翌日、ExitはScan+1+20日
+        # 営業日計算は複雑なので、簡易的にカレンダー日で判定
+        entry_date = scan_date = scan_time.date() + timedelta(days=1)
+        exit_date_est = entry_date + timedelta(days=30) # Approx 20 trading days
         
-        # 過去データ取得（現在より未来ならSkip）
-        if start_date >= datetime.now().date():
+        today = datetime.now().date()
+        
+        # 1. まだEntry日が来ていない -> Ignored
+        if entry_date > today:
             continue
             
-        # 平均リターン計算
-        returns = []
+        # 2. 期間終了済み (Closed)
+        is_closed = today >= exit_date_est
+        
+        # バッチ取得で高速化したいが、ここでは個別取得
+        # (実運用では yf.download(..., group_by='ticker') を推奨)
+        
+        run_pnl = []
+        
         for _, row in run_data.iterrows():
+            ticker = row['Ticker']
             try:
-                # 実際のヒストリカルデータを取得
-                hist = yf.Ticker(row['Ticker']).history(start=start_date, end=end_date)
-                if len(hist) > 0:
-                    entry = hist['Open'].iloc[0]
-                    exit_price = hist['Open'].iloc[-1]
-                    # コスト控除 (Exit時)
-                    ret = ((exit_price - entry) / entry) - COST_RATE
-                    returns.append(ret)
+                # 必要な期間のデータを取得
+                df_price = yf.Ticker(ticker).history(start=entry_date, end=exit_date_est + timedelta(days=5))
+                
+                if df_price.empty: continue
+                
+                # Entry Price (期間初日のOpen)
+                real_entry = df_price['Open'].iloc[0]
+                
+                if is_closed:
+                    # Exit Price (20日目のOpen、あるいは期間末のOpen)
+                    # インデックスエラー回避
+                    idx = min(len(df_price)-1, 20) 
+                    real_exit = df_price['Open'].iloc[idx]
+                    
+                    # 厳格なコスト控除リターン
+                    net_ret = calculate_net_return(real_entry, real_exit, COST_RATE)
+                    
+                    closed_trades.append({
+                        "Run_ID": rid,
+                        "Ticker": ticker,
+                        "Entry_Date": entry_date,
+                        "Exit_Date": df_price.index[idx].date(),
+                        "Entry_Price": real_entry,
+                        "Exit_Price": real_exit,
+                        "Net_Return": net_ret
+                    })
+                else:
+                    # Active (含み損益)
+                    curr_price = df_price['Close'].iloc[-1]
+                    unrealized_ret = calculate_net_return(real_entry, curr_price, COST_RATE)
+                    
+                    active_trades.append({
+                        "Run_ID": rid,
+                        "Ticker": ticker,
+                        "Entry_Date": entry_date,
+                        "Entry_Price": real_entry,
+                        "Current_Price": curr_price,
+                        "Unrealized_Net": unrealized_ret
+                    })
             except:
                 continue
         
-        if returns:
-            avg_ret = np.mean(returns)
-            # 資産曲線の更新 (単利加算ではなく複利運用と仮定)
-            current_equity = current_equity * (1 + avg_ret)
-            equity_curve.append(current_equity)
-            dates.append(scan_date_str.split(" ")[0])
-            
-            # QQQのリターンも取得（同期間）
-            try:
-                q_hist = qqq.history(start=start_date, end=end_date)
-                if len(q_hist) > 0:
-                    q_ret = (q_hist['Open'].iloc[-1] - q_hist['Open'].iloc[0]) / q_hist['Open'].iloc[0]
-                else:
-                    q_ret = 0.0
-            except:
-                q_ret = 0.0
-                
-            performance_records.append({
-                "Date": scan_date_str,
-                "Strategy_Ret": avg_ret,
-                "QQQ_Ret": q_ret,
-                "Equity": current_equity
-            })
+        progress.progress((i + 1) / len(run_ids))
+        
+    return pd.DataFrame(closed_trades), pd.DataFrame(active_trades)
 
-    if not performance_records:
-        return None
-
-    df_perf = pd.DataFrame(performance_records)
-    
-    # ドローダウン計算
-    df_perf['Peak'] = df_perf['Equity'].cummax()
-    df_perf['Drawdown'] = (df_perf['Equity'] - df_perf['Peak']) / df_perf['Peak']
-    max_dd = df_perf['Drawdown'].min()
-    
-    total_return = (current_equity - initial_equity) / initial_equity
-    
-    return {
-        "df": df_perf,
-        "total_return": total_return,
-        "max_dd": max_dd,
-        "equity_curve": equity_curve,
-        "dates": dates
-    }
-
-# --- 6. UI構築 ---
-tab1, tab2 = st.tabs(["🚀 System Execution", "📊 Analytics & Audit"])
+# --- 7. UI構築 ---
+tab1, tab2 = st.tabs(["🚀 Execution (Log & Anchor)", "⚖️ Integrity Audit"])
 
 with tab1:
-    st.title("🦅 Market Edge Pro (Execution)")
-    st.caption(f"Ver: {MODEL_VERSION} | Protocol Hash: {PROTOCOL_HASH} | Local Chain")
-
-    bench_price = fetch_market_context()
-    st.metric("Context: QQQ", f"${bench_price:.2f}")
-
-    with st.expander("📜 Defined Protocol (変更不可)", expanded=True):
-        st.code(PROTOCOL_DEF)
-        st.caption("※この定義を変更するとプロトコルハッシュが変わり、過去ログとの連続性が警告されます。")
+    st.title("🦅 Market Edge Pro (Integrity)")
+    st.caption(f"Ver: {PROTOCOL_VER} | Cost: {COST_RATE:.1%} (Round-Trip) | Chain: Active")
+    
+    # アンカー情報の表示 (これが外部保存すべきID)
+    integrity_hash = get_file_integrity_hash()
+    if integrity_hash != "NO_DATA":
+        st.info(f"🔒 **Commitment Anchor:** `{integrity_hash}`")
+        st.caption("※このコードを手帳やSNSに記録してください。ファイルが改変されると、このコードが変わります。")
 
     TARGETS = ["NVDA", "MSFT", "AAPL", "AMZN", "GOOGL", "META", "TSLA", "AVGO", "AMD", "PLTR", "ARM", "SMCI", "COIN", "CRWD", "LLY", "NVO", "COST", "NFLX", "INTC"]
 
-    if st.button("EXECUTE RUN & LOG", type="primary"):
+    if st.button("EXECUTE RUN", type="primary"):
         raw_df = fetch_stock_data(TARGETS)
         if not raw_df.empty:
             portfolio_df, logs = build_portfolio(raw_df)
-            final_df, data_hash = save_to_history(portfolio_df)
+            final_df = save_to_history(portfolio_df)
             
-            st.success(f"✅ Logged with Hash: {data_hash}")
+            st.success("✅ Logged. Update your anchor.")
+            
+            # 最新のアンカーを再計算して表示
+            new_anchor = get_file_integrity_hash()
+            st.code(new_anchor, language="text", label="New Commitment Anchor (Copy this)")
+            
             if logs:
                 for l in logs: st.warning(l)
             
@@ -331,27 +328,41 @@ with tab1:
             st.error("Data Error")
 
 with tab2:
-    st.header("📊 Strategy Analytics (累積成績)")
+    st.header("⚖️ Integrity Audit (Closed Trades Only)")
+    st.caption("確定した取引（20営業日経過）のみを集計します。含み益はここには含まれません。")
     
-    if st.button("🔄 Calculate Performance"):
-        if os.path.exists(HISTORY_FILE):
-            df_hist = pd.read_csv(HISTORY_FILE)
-            stats = calculate_advanced_stats(df_hist)
+    if st.button("🔄 Audit Performance"):
+        df_closed, df_active = audit_performance()
+        
+        if df_closed is not None and not df_closed.empty:
+            # 資産曲線の作成
+            df_closed = df_closed.sort_values('Exit_Date')
+            df_closed['Cumulative_Return'] = (1 + df_closed['Net_Return']).cumprod()
             
-            if stats:
-                c1, c2, c3 = st.columns(3)
-                c1.metric("Total Return", f"{stats['total_return']:.2%}")
-                c2.metric("Max Drawdown", f"{stats['max_dd']:.2%}", delta_color="inverse")
-                c3.metric("Samples", f"{len(stats['df'])}")
-                
-                # 資産曲線チャート
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(x=stats['dates'], y=stats['equity_curve'], mode='lines', name='Strategy Equity'))
-                # (簡易比較のためQQQの累積は割愛するが、本来はここに重ねる)
-                st.plotly_chart(fig, use_container_width=True)
-                
-                st.dataframe(stats['df'], use_container_width=True)
-            else:
-                st.warning("Not enough data or pending trades.")
+            # ドローダウン
+            df_closed['Peak'] = df_closed['Cumulative_Return'].cummax()
+            df_closed['Drawdown'] = (df_closed['Cumulative_Return'] - df_closed['Peak']) / df_closed['Peak']
+            max_dd = df_closed['Drawdown'].min()
+            total_ret = df_closed['Cumulative_Return'].iloc[-1] - 1
+            
+            # KPI表示
+            k1, k2, k3 = st.columns(3)
+            k1.metric("Realized Return", f"{total_ret:.2%}")
+            k2.metric("Max Drawdown", f"{max_dd:.2%}", delta_color="inverse")
+            k3.metric("Closed Trades", f"{len(df_closed)}")
+            
+            # チャート
+            
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=df_closed['Exit_Date'], y=df_closed['Cumulative_Return'], mode='lines+markers', name='Equity (Net)'))
+            st.plotly_chart(fig, use_container_width=True)
+            
+            st.subheader("Closed Trade Log")
+            st.dataframe(df_closed)
         else:
-            st.info("No history log found.")
+            st.warning("No closed trades found yet. (Wait 20 days after first run)")
+            
+        if df_active is not None and not df_active.empty:
+            st.divider()
+            st.subheader("Active Positions (Unrealized)")
+            st.dataframe(df_active)
