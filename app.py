@@ -3,10 +3,10 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # --- 1. アプリ設定 ---
-st.set_page_config(page_title="Market Edge Pro - Final Quant", page_icon="🦅", layout="wide")
+st.set_page_config(page_title="Market Edge Pro - Robust Quant", page_icon="🦅", layout="wide")
 
 # --- 2. データ取得・分析ロジック ---
 @st.cache_data(ttl=3600)
@@ -14,10 +14,10 @@ def fetch_stock_data(tickers):
     data_list = []
     fetch_time = datetime.now().strftime('%Y-%m-%d %H:%M')
     
-    with st.status("🦅 市場データを取得・定量的採点中...", expanded=True) as status:
+    with st.status("🦅 データ取得・定量的採点プロセス実行中...", expanded=True) as status:
         total = len(tickers)
         for i, ticker in enumerate(tickers):
-            status.update(label=f"🦅 演算中... {ticker} ({i+1}/{total})")
+            status.update(label=f"Processing... {ticker} ({i+1}/{total})")
             
             try:
                 stock = yf.Ticker(ticker)
@@ -42,36 +42,34 @@ def fetch_stock_data(tickers):
                 
                 if official_peg is not None:
                     peg_val = official_peg
-                    peg_type = "Official" # 公式(5年予想ベース等)
+                    peg_type = "Official"
                 elif fwd_pe is not None and growth is not None and growth > 0:
                     peg_val = fwd_pe / (growth * 100)
-                    peg_type = "Proxy" # 参考値(期間ズレあり)
+                    peg_type = "Proxy"
                 
                 # 2. Trend (SMA)
                 sma50 = hist['Close'].rolling(window=50).mean().iloc[-1]
                 sma200 = hist['Close'].rolling(window=200).mean().iloc[-1]
                 
-                # 3. Consensus (Spreadの定量的定義)
+                # 3. Consensus (Spread定義: (High-Low)/Mean)
                 target_mean = info.get('targetMeanPrice')
                 target_high = info.get('targetHighPrice')
                 target_low = info.get('targetLowPrice')
                 analysts = info.get('numberOfAnalystOpinions', 0)
                 
                 upside_val = np.nan
-                spread_val = 0.0 # 意見のバラつき度合い (0.0 ~ 1.0+)
+                spread_val = 0.0
                 
                 if target_mean and price > 0:
                     upside_val = (target_mean - price) / price
                     if target_high and target_low and target_mean > 0:
-                        # 定義: (High - Low) / Mean
                         spread_val = (target_high - target_low) / target_mean
 
-                # --- B. スコアリング (連続的数理モデル) ---
+                # --- B. スコアリング (堅牢化モデル) ---
                 score = 0
                 breakdown = []
 
-                # 1. 割安性 (PEG) - Max 30点
-                # Critic指摘対応: Proxyの場合は「PEG項目のスコア」のみ50%割引（Valuation全体ではない）
+                # 1. Valuation (PEG) - Max 30
                 peg_weight = 0.5 if peg_type == "Proxy" else 1.0
                 
                 if pd.notna(peg_val):
@@ -83,55 +81,55 @@ def fetch_stock_data(tickers):
                     final_points = int(base_points * peg_weight)
                     
                     if final_points > 0:
-                        type_label = "参考値割引(50%)" if peg_type == "Proxy" else "公式"
+                        type_label = "Weight 0.5" if peg_type == "Proxy" else "Weight 1.0"
                         score += final_points
                         breakdown.append(f"PEG {peg_val:.2f} ({type_label}): +{final_points}")
                 else:
                     breakdown.append("PEG算出不可: 0")
 
-                # 2. トレンド (SMA配列) - Max 30点
-                trend_str = "レンジ/下降"
+                # 2. Trend (SMA) - Max 30
+                trend_str = "Range/Down"
                 if price > sma50 > sma200:
                     score += 30
-                    trend_str = "📈 Pオーダー"
-                    breakdown.append("上昇トレンド(Pオーダー): +30")
+                    trend_str = "📈 Perfect Order"
+                    breakdown.append("Trend (P-Order): +30")
                 elif price < sma50:
-                    trend_str = "📉 調整局面"
-                    breakdown.append("トレンド崩れ(50日線割れ): 0")
+                    trend_str = "📉 Downtrend"
+                    breakdown.append("Trend (Below SMA50): 0")
 
-                # 3. アップサイド (Spreadによる連続割引) - Max 20点
-                # Critic指摘対応: 閾値(60%)の崖を廃止し、Spread分だけリニアに価値を割り引く
-                # モデル: 獲得スコア = 基礎点 * (1 - Spread)  ※Spreadが大きいほど価値減
+                # 3. Upside (Discount Model) - Max 20
+                # Critic修正: Spreadが100%を超えても破綻しないよう、係数を0.0でClipする
                 if analysts >= 5:
-                    base_upside_score = 0
-                    if upside_val > 0.2: base_upside_score = 20
-                    elif upside_val > 0.1: base_upside_score = 10
+                    base_upside = 0
+                    if upside_val > 0.2: base_upside = 20
+                    elif upside_val > 0.1: base_upside = 10
                     
-                    if base_upside_score > 0:
-                        # 割引係数 (Spreadが100%以上の場合は価値0とする)
+                    if base_upside > 0:
+                        # 割引係数: 0.0 〜 1.0 の範囲に収める (Clamping)
                         discount_factor = max(0.0, 1.0 - spread_val)
-                        final_upside_score = int(base_upside_score * discount_factor)
+                        final_upside = int(base_upside * discount_factor)
                         
-                        score += final_upside_score
-                        breakdown.append(f"上値{upside_val:.1%} (Spread割引 {-spread_val:.0%}): +{final_upside_score}")
+                        score += final_upside
+                        # 内訳表示も正確に
+                        breakdown.append(f"Upside {upside_val:.1%} (Factor {discount_factor:.2f}): +{final_upside}")
                 else:
-                     breakdown.append(f"アナリスト不足({analysts}名): 0")
+                     breakdown.append(f"Low Coverage ({analysts}): 0")
 
-                # 4. RSI (過熱感) - Max 20点
+                # 4. RSI - Max 20
                 delta = hist['Close'].diff()
                 gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
                 loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
                 rs = gain / loss
                 rsi = 100 - (100 / (1 + rs)).iloc[-1]
                 
-                if 40 <= rsi <= 60 and "Pオーダー" in trend_str:
+                if 40 <= rsi <= 60 and "Perfect" in trend_str:
                     score += 20
-                    breakdown.append("RSI押し目(40-60): +20")
+                    breakdown.append("RSI Dip (40-60): +20")
                 elif rsi > 75:
                     score -= 10
-                    breakdown.append("RSI過熱(75超): -10")
+                    breakdown.append("RSI Overbought (>75): -10")
 
-                # グレード判定
+                # Grade
                 grade = "C"
                 if score >= 80: grade = "S"
                 elif score >= 60: grade = "A"
@@ -144,7 +142,6 @@ def fetch_stock_data(tickers):
                     "Grade": grade,
                     "Score": int(score),
                     "Breakdown": " / ".join(breakdown),
-                    # --- Raw Data ---
                     "PEG_Val": peg_val,
                     "PEG_Type": peg_type,
                     "SMA50": sma50,
@@ -162,7 +159,7 @@ def fetch_stock_data(tickers):
             except Exception:
                 continue
         
-        status.update(label="✅ 定量的解析完了 (Verified)", state="complete", expanded=False)
+        status.update(label="✅ 計算完了 (Calculation Complete)", state="complete", expanded=False)
     
     return pd.DataFrame(data_list)
 
@@ -178,50 +175,58 @@ def plot_chart(ticker, hist):
     
     fig.add_trace(go.Scatter(x=hist.index, y=sma50, line=dict(color='orange', width=1.5), name='SMA 50'))
     fig.add_trace(go.Scatter(x=hist.index, y=sma200, line=dict(color='blue', width=1.5), name='SMA 200'))
-    fig.update_layout(title=f"{ticker} Verification Chart (1Y)", height=400, template="plotly_dark")
+    fig.update_layout(title=f"{ticker} 1Y Chart", height=400, template="plotly_dark")
     return fig
 
 # --- 4. メイン画面 ---
-st.title("🦅 Market Edge Pro (Final Quant)")
-st.caption("連続的な数理モデルに基づく、恣意性を排除した分析ツール")
+st.title("🦅 Market Edge Pro (Robust Quant)")
+st.caption("定義された数理モデルと検証プロトコルに基づくスクリーニング")
 
-# ★数理モデルの定義開示
-with st.expander("📊 採点モデルの数式定義 (Mathematical Model)", expanded=True):
+# ★検証プロトコル（レギュレーション）の固定
+with st.expander("📜 Verification Protocol (検証用運用規定)", expanded=True):
     st.markdown("""
-    本アプリは「任意の閾値」を排除し、以下の数式に基づいてリスクをスコアに連続的に反映させます。
+    本ツールの有効性を検証する場合、以下の**「標準プロトコル」**に従ってください。
+    都合の良い抽出を防ぐため、ルールを固定します。
     
-    ### 1. 不確実性の割引モデル (Consensus Discount)
-    アナリストの意見が割れている場合、その「不確実性の分量」だけ上値余地のスコアを減額します。
-    * **Spread定義:** `(TargetHigh - TargetLow) / TargetMean`
-    * **スコア算出:** `基礎点 × (1.0 - Spread)`
-        * 例: Spreadが20%なら、スコアは80%掛けになります。Spreadが広がるほど価値は0に近づきます。
-    
-    ### 2. データ精度の重み付け (Proxy Weighting)
-    * **公式PEG:** 信頼度 100% (Weight 1.0)
-    * **Proxy PEG:** 信頼度 50% (Weight 0.5) ※期間ズレのリスクを定数で割引
-    
-    ### 3. 検証機能 (Track Record)
-    * 下の「CSVダウンロード」ボタンで結果を保存し、1ヶ月後に実際の株価と照らし合わせてください。
+    | 項目 | 規定内容 |
+    | :--- | :--- |
+    | **エントリー** | 抽出日の**翌営業日 始値 (Open)** |
+    | **対象銘柄** | スコア上位 3〜5銘柄 (Sランク優先) |
+    | **リバランス** | **1ヶ月後** の始値で売却・入れ替え |
+    | **ベンチマーク** | 同期間の **NASDAQ100 (QQQ)** または **S&P500 (VOO)** |
+    | **コスト考慮** | 売買手数料・税金は簡易的に **-1.0%** として計算すること |
+    """)
+
+# ★数理モデルの定義（修正版）
+with st.expander("📊 Mathematical Model (数理定義)", expanded=False):
+    st.markdown("""
+    * **Spread Discount (不確実性割引):**
+        * `Factor = max(0.0, 1.0 - Spread)`
+        * ※Spreadが100%を超える場合、係数は0.0（価値ゼロ）となりマイナスにはなりません。
+    * **Analyst Coverage:**
+        * `n < 5` の場合、コンセンサススコアは一律 0点。
+    * **Proxy Weight:**
+        * PEGがProxy（簡易計算）の場合、加点幅を一律 `x 0.5` に減額。
     """)
 
 TARGETS = ["NVDA", "MSFT", "AAPL", "AMZN", "GOOGL", "META", "TSLA", "AVGO", "AMD", "PLTR", "ARM", "SMCI", "COIN", "CRWD", "LLY", "NVO", "COST", "NFLX", "INTC"]
 
-if st.button("🔍 厳格スキャンを実行 (数理モデル適用)", type="primary"):
+if st.button("🔍 データ取得・定量的スキャン実行", type="primary"):
     df = fetch_stock_data(TARGETS)
     
     if not df.empty:
         df = df.sort_values('Score', ascending=False).reset_index(drop=True)
         
-        # CSVダウンロードボタン (検証用)
+        # 検証用CSV
         csv = df.to_csv(index=False).encode('utf-8')
         st.download_button(
-            label="📥 分析結果をCSVで保存 (検証用)",
+            label="📥 検証用データをCSVで保存 (Save for Backtest)",
             data=csv,
-            file_name=f'market_edge_result_{datetime.now().strftime("%Y%m%d")}.csv',
+            file_name=f'quant_scan_{datetime.now().strftime("%Y%m%d")}.csv',
             mime='text/csv',
         )
         
-        st.subheader(f"🏆 スクリーニング結果 (Data at: {df['FetchTime'][0]})")
+        st.subheader(f"🏆 Screening Results (Data at: {df['FetchTime'][0]})")
         
         st.dataframe(
             df[['Ticker', 'Price', 'Score', 'PEG_Val', 'PEG_Type', 'Spread', 'Upside']]
@@ -229,43 +234,42 @@ if st.button("🔍 厳格スキャンを実行 (数理モデル適用)", type="p
             .format({
                 'Price': '${:.2f}',
                 'Score': '{:.0f}',
-                'PEG_Val': '{:.2f}倍',
+                'PEG_Val': '{:.2f}',
                 'Spread': '{:.1%}', 
                 'Upside': '{:.1%}'
             })
             .background_gradient(subset=['Score'], cmap='Greens', vmin=0, vmax=100)
-            .background_gradient(subset=['Spread'], cmap='Reds', vmin=0.0, vmax=0.8)
+            .background_gradient(subset=['Spread'], cmap='Reds', vmin=0.0, vmax=1.0)
             .highlight_null(color='gray'),
             use_container_width=True,
             height=600
         )
-        st.caption("※Spread: (High-Low)/Mean。数値が大きいほどアナリストの意見が割れており、スコアが割り引かれています。")
+        st.caption("※Spread > 100% の場合、Upside評価は0点となります（係数0.0）")
 
-        # --- 個別詳細検証エリア ---
+        # --- 詳細検証エリア ---
         st.divider()
-        st.header("🧐 Model Inspection (数理検証)")
+        st.header("🧐 Factor Inspection")
         
-        selected_ticker = st.selectbox("詳細データを確認する銘柄:", df['Ticker'].tolist())
+        selected_ticker = st.selectbox("Select Ticker for Inspection:", df['Ticker'].tolist())
         
         if selected_ticker:
             row = df[df['Ticker'] == selected_ticker].iloc[0]
             
+            # Spread係数の計算（表示用）
+            discount_factor = max(0.0, 1.0 - row['Spread'])
+            
             c1, c2 = st.columns([1, 1])
             
             with c1:
-                st.subheader("1. Consensus & Spread Logic")
-                
+                st.subheader("1. Quant Metrics")
                 st.code(f"""
-[Spread Calculation]
-High      : ${row['Target_High']}
-Mean      : ${row['Target_Mean']}
-Low       : ${row['Target_Low']}
-Formula   : ({row['Target_High']} - {row['Target_Low']}) / {row['Target_Mean']}
-Result    : {row['Spread']:.2%} (Discount Factor: {max(0, 1.0-row['Spread']):.2f})
+[Uncertainty Model]
+Spread (H-L/Mean): {row['Spread']:.2%}
+Discount Factor  : {discount_factor:.2f} (Min 0.0)
 
-[Valuation Weight]
-PEG Type  : {row['PEG_Type']}
-Weight    : {"0.5 (Proxy)" if row['PEG_Type']=="Proxy" else "1.0 (Official)"}
+[Valuation Logic]
+PEG Type         : {row['PEG_Type']}
+Applied Weight   : {"0.5" if row['PEG_Type']=="Proxy" else "1.0"}
                 """, language="yaml")
                 
                 stock = yf.Ticker(selected_ticker)
@@ -273,16 +277,16 @@ Weight    : {"0.5 (Proxy)" if row['PEG_Type']=="Proxy" else "1.0 (Official)"}
                 st.plotly_chart(plot_chart(selected_ticker, hist), use_container_width=True)
 
             with c2:
-                st.subheader("2. Score Breakdown")
+                st.subheader("2. Score Logic")
                 st.metric("Total Score", f"{row['Score']} / 100")
                 
                 reasons = row['Breakdown'].split(" / ")
                 for r in reasons:
                     if "PEG" in r: st.success(f"💰 {r}")
-                    elif "Pオーダー" in r: st.info(f"📈 {r}")
-                    elif "Spread" in r: st.warning(f"🎯 {r}") # 割引適用済
+                    elif "Trend" in r: st.info(f"📈 {r}")
+                    elif "Upside" in r: st.warning(f"🎯 {r}") 
                     elif "RSI" in r: st.error(f"📊 {r}")
                     else: st.write(f"・{r}")
             
     else:
-        st.error("データ取得に失敗しました。")
+        st.error("Data fetch failed.")
