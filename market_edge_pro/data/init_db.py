@@ -4,28 +4,27 @@ import os
 DB_PATH = "trading_journal.db"
 
 def init_db():
-    if os.path.exists(DB_PATH):
-        print(f"Database {DB_PATH} already exists.")
-        return
-
+    # 既存のDBがあっても安全に再利用する
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
 
     # 1. 監視リスト
     c.execute('''
-        CREATE TABLE watchlists (
+        CREATE TABLE IF NOT EXISTS watchlists (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
             symbols TEXT NOT NULL
         )
     ''')
-    # 初期データ投入
-    c.execute("INSERT INTO watchlists (name, symbols) VALUES (?, ?)", 
-              ("Default Watchlist", "AAPL,MSFT,TSLA,NVDA,GOOGL,AMZN,META,AMD"))
+    # データが空なら初期値を入れる
+    c.execute("SELECT count(*) FROM watchlists")
+    if c.fetchone()[0] == 0:
+        c.execute("INSERT INTO watchlists (name, symbols) VALUES (?, ?)", 
+                  ("Default Watchlist", "AAPL,MSFT,TSLA,NVDA,GOOGL,AMZN,META,AMD"))
 
     # 2. ルール定義
     c.execute('''
-        CREATE TABLE rule_sets (
+        CREATE TABLE IF NOT EXISTS rule_sets (
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL,
             json_body TEXT NOT NULL
@@ -34,7 +33,7 @@ def init_db():
 
     # 3. スキャン結果
     c.execute('''
-        CREATE TABLE scan_results (
+        CREATE TABLE IF NOT EXISTS scan_results (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             scanned_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             rule_set_id TEXT,
@@ -47,7 +46,7 @@ def init_db():
 
     # 4. 取引日誌
     c.execute('''
-        CREATE TABLE journal_entries (
+        CREATE TABLE IF NOT EXISTS journal_entries (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             symbol TEXT NOT NULL,
             entry_date DATE,
@@ -61,7 +60,7 @@ def init_db():
 
     conn.commit()
     conn.close()
-    print(f"Created {DB_PATH} successfully.")
+    print(f"Database {DB_PATH} is ready.")
 
 if __name__ == "__main__":
     init_db()
