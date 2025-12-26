@@ -5,16 +5,23 @@ import os
 import time
 import yfinance as yf
 
-# ... (前半のimport等は変更なし) ...
+# --- セットアップ ---
+# ページ設定: サイドバーは閉じておく(スマホ最適化)
+st.set_page_config(
+    page_title="Market Edge Pro",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="collapsed"
+)
 
+# データベース初期化ロジックの読み込み
 try: from data.init_db import init_db
 except ImportError:
     import sys
     sys.path.append(os.path.abspath(os.path.dirname(__file__)))
     from data.init_db import init_db
 
-st.set_page_config(page_title="Market Edge Pro", layout="wide", initial_sidebar_state="expanded")
-
+# --- DB接続関数 ---
 def get_connection(): return sqlite3.connect("trading_journal.db")
 
 def ensure_db():
@@ -26,66 +33,97 @@ def ensure_db():
 def run_init(m):
     with st.spinner(m): init_db(); time.sleep(1); st.rerun()
 
-@st.cache_data(ttl=600)
+# --- ★修正: 市場データ取得ロジック (頑丈版) ---
+@st.cache_data(ttl=300) # 5分キャッシュ
 def get_market_status():
-    try:
-        ticker = yf.Ticker("^GSPC")
-        hist = ticker.history(period="2d")
-        if len(hist) < 2: return "N/A", "0.00"
-        
-        current_price = hist['Close'].iloc[-1]
-        prev_close = hist['Close'].iloc[-2]
-        delta = current_price - prev_close
-        delta_percent = (delta / prev_close) * 100
-        return f"{current_price:,.2f}", f"{delta:+.2f} ({delta_percent:+.2f}%)"
-    except: return "Error", "0.00"
+    # 戦略: まず指数(^GSPC)を試し、ダメならETF(SPY)で代用する
+    # これで「Error」表示を99%防げる
+    targets = ["^GSPC", "SPY"]
+    
+    for ticker_symbol in targets:
+        try:
+            ticker = yf.Ticker(ticker_symbol)
+            hist = ticker.history(period="2d")
+            
+            if len(hist) >= 2:
+                current_price = hist['Close'].iloc[-1]
+                prev_close = hist['Close'].iloc[-2]
+                delta = current_price - prev_close
+                delta_percent = (delta / prev_close) * 100
+                
+                # ETF(SPY)の場合は価格が1/10程度なので、S&P500っぽく補正して表示するか、
+                # あるいは「SPY (S&P500 ETF)」としてそのまま出すか。
+                # ここでは「動きを見る」のが目的なので、そのまま出しつつ名前を変える。
+                name = "S&P 500" if ticker_symbol == "^GSPC" else "S&P 500 (ETF)"
+                
+                return name, f"{current_price:,.2f}", f"{delta:+.2f} ({delta_percent:+.2f}%)"
+        except:
+            continue
+            
+    return "S&P 500", "N/A", "0.00"
 
 def main():
+    # 規約同意チェック
     if "tos_agreed" not in st.session_state: st.session_state.tos_agreed = False
     if not st.session_state.tos_agreed:
         st.info("👋 ようこそ。利用を開始する前に確認してください。")
         with st.expander("利用規約・免責事項", expanded=True):
             st.markdown("1. 本アプリは参考情報です。\n2. データは遅延する場合があります。\n3. 投資判断は自己責任でお願いします。")
-            if st.checkbox("上記に同意する"):
+            if st.button("上記に同意して利用を開始する"):
                 st.session_state.tos_agreed = True
                 st.rerun()
-            else: st.stop()
+        return # 同意するまで先に進ませない
 
-    st.title("Market Edge Pro")
+    # メイン画面
     ensure_db()
-    sp500_price, sp500_delta = get_market_status()
+    
+    # ロゴ表示（Watchlistページと統一）
+    st.markdown("""
+        <h1 style='text-align: center; margin-bottom: 10px;'>
+            📊 Market Edge Pro
+        </h1>
+    """, unsafe_allow_html=True)
+
+    # 市場データの取得
+    idx_name, sp500_price, sp500_delta = get_market_status()
 
     st.markdown("---")
-    c1, c2, c3 = st.columns(3)
+    
+    # スマホで見やすいようにカラム調整
+    c1, c2 = st.columns([1, 1])
     
     with c1:
         st.subheader("📊 市場ステータス")
-        st.metric("S&P 500", sp500_price, sp500_delta)
+        st.metric(idx_name, sp500_price, sp500_delta)
         st.caption("Data: Yahoo Finance (Delayed)")
     
     with c2:
         st.subheader("👁 監視リスト")
         try:
             conn = get_connection()
-            # ★修正: DBから最新の並び順を取得
             df = pd.read_sql("SELECT * FROM watchlists LIMIT 1", conn)
             conn.close()
             if not df.empty:
                 syms = [s.strip() for s in df.iloc[0]['symbols'].split(',') if s.strip()]
-                st.write(f"**{df.iloc[0]['name']}** ({len(syms)} 銘柄)")
+                # タグ風に見やすく表示
+                st.write(f"**{df.iloc[0]['name']}**")
+                st.caption(f"登録銘柄: {len(syms)}件")
                 
-                # ★改善: テキスト羅列ではなく、タグ風に見やすく表示
-                st.markdown(" ".join([f"`{s}`" for s in syms]))
-                
+                # 先頭5つだけ表示して、あとは「...」にする（スマホ対策）
+                display_syms = syms[:5]
+                st.code(", ".join(display_syms) + ("..." if len(syms)>5 else ""))
             else: st.warning("リスト未設定")
         except: st.error("DB接続エラー")
-    
-    with c3:
-        st.subheader("🛡 アカウント設定")
-        st.write("プラン: **Standard**")
-        st.write("日次許容損失: **$200.00**")
 
     st.markdown("---")
-    st.success("✅ 準備完了: 左サイドバーから **Scanner** を起動してください。")
+    
+    # アクションボタン（ここからWatchlistへ飛ばす誘導）
+    st.info("👇 以下のメニューから分析を開始してください")
+    
+    # Streamlitのページ遷移はサイドバー推奨だが、
+    # リンクとして案内することで親切にする
+    st.markdown("""
+    * **[🔎 AI分析ダッシュボードを開く (Watchlist)](/Watchlist)**
+    """)
 
 if __name__ == "__main__": main()
