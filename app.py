@@ -8,43 +8,57 @@ import hashlib
 import uuid
 import pytz
 
-# --- 1. アプリ憲法 & 用語辞書 (仕様 v1.1) ---
-st.set_page_config(page_title="Market Edge Pro v1.1", page_icon="🦅", layout="wide")
+# --- 1. アプリ憲法 & 用語辞書 (v1.2 仕様) ---
+st.set_page_config(page_title="Market Edge Pro v1.2", page_icon="🦅", layout="wide")
 
-VERSION = "v1.1_Public_Release"
-HISTORY_FILE = "public_execution_log.csv"
+VERSION = "v1.2_Public_Beta"
+HISTORY_FILE = "public_execution_log_v1_2.csv"
 
-# 判定基準の固定 (要件B)
+# 判定基準 (仕様6)
 SPEC = {
     "SMA_PERIOD": 50,
     "ATR_PERIOD": 14,
-    "STOP_MULT": 2.0,      # 損切り幅: ATRの2倍
-    "TARGET_MULT": 4.0,    # 目標幅: ATRの4倍 (短期)
-    "RR_THRESHOLD": 2.00,  # R/R 閾値: 2.00以上
-    "DIP_LIMIT": 0.05      # 押し目許容: SMA+5%以内
+    "STOP_MULT": 2.0,
+    "TARGET_MULT": 4.0,
+    "RR_THRESHOLD": 2.00,
+    "DIP_LIMIT": 0.05
 }
 
-# プリセット銘柄 (要件C)
+# プリセット (仕様C)
 PRESETS = {
     "🇺🇸 米国・大型テック": ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA"],
     "🏎️ 半導体・AI": ["AVGO", "AMD", "ARM", "SMCI", "ASML", "TSM", "INTC"],
     "🦅 厳選ウォッチ": ["PLTR", "CRWD", "LLY", "NFLX", "COST", "COIN", "MSTR"]
 }
 
-# --- 2. ユーティリティ & 監査 (要件B, D) ---
+# 表示文言 (仕様4, 8)
+LBL = {
+    "CAT_BUY": "買い候補",
+    "CAT_WATCH": "監視・待機",
+    "CAT_EXCL": "対象外",
+    "ACT_BUY": "本日終値が条件を満たすか確認 → 条件一致なら自身のルールで検討",
+    "ACT_WAIT_PRICE": "再確認ライン(SMA50)付近までの調整を待つ",
+    "ACT_WAIT_COND": "R/Rなどの条件が整うのを待つ",
+    "ACT_NONE": "現在は何もしない（トレンド不適合など）"
+}
+
+# --- 2. ユーティリティ ---
 
 def get_verification_code():
     if not os.path.exists(HISTORY_FILE): return "NO_DATA"
     with open(HISTORY_FILE, "rb") as f:
         return hashlib.sha256(f.read()).hexdigest()[:12]
 
-def log_feedback(run_id, sentiment, comment):
-    """簡易的なフィードバック記録 (本番は外部DBやメール連携推奨)"""
-    fb_file = "feedback_log.txt"
-    with open(fb_file, "a", encoding="utf-8") as f:
-        f.write(f"[{datetime.now()}] ID:{run_id} | Rank:{sentiment} | Msg:{comment}\n")
+def log_feedback(data):
+    """フィードバック記録 (要件5)"""
+    with open("feedback_log.txt", "a", encoding="utf-8") as f:
+        f.write(f"{datetime.now()} | {data}\n")
 
-# --- 3. 分析エンジン (要件A, E) ---
+def convert_df(df):
+    """CSVダウンロード用 (要件6-2)"""
+    return df.to_csv(index=False).encode('utf-8')
+
+# --- 3. 分析エンジン ---
 
 def calculate_atr(df, period=14):
     high_low = df['High'] - df['Low']
@@ -53,149 +67,223 @@ def calculate_atr(df, period=14):
     ranges = pd.concat([high_low, high_close, low_close], axis=1)
     return ranges.max(axis=1).rolling(period).mean().iloc[-1]
 
-@st.cache_data(ttl=1800) # 30分キャッシュ (要件E)
+@st.cache_data(ttl=1800) # 30分キャッシュ (要件10)
 def scan_market(tickers):
     results = []
     run_id = str(uuid.uuid4())[:8]
     now_jp = datetime.now(pytz.timezone('Asia/Tokyo')).strftime('%Y-%m-%d %H:%M')
     
-    progress_text = st.empty()
-    bar = st.progress(0)
+    # プログレス表示
+    prog_text = st.empty()
+    prog_bar = st.progress(0)
     
     for i, ticker in enumerate(tickers):
-        progress_text.text(f"スキャン中: {ticker} ({i+1}/{len(tickers)})")
-        bar.progress((i+1)/len(tickers))
+        prog_text.text(f"データ取得・判定中... ({i+1}/{len(tickers)}): {ticker}")
+        prog_bar.progress((i + 1) / len(tickers))
         try:
             stock = yf.Ticker(ticker)
             hist = stock.history(period="6mo")
-            if len(hist) < 60: continue
             
+            # データ異常検知 (仕様5)
+            if len(hist) < 60:
+                results.append({"銘柄": ticker, "判定": LBL["CAT_EXCL"], "理由": "データ不足", "詳細": "履歴なし"})
+                continue
+            
+            # 鮮度チェック
+            last_date = hist.index[-1]
             price = hist['Close'].iloc[-1]
+            
+            # 指標計算
             sma_series = hist['Close'].rolling(window=SPEC["SMA_PERIOD"]).mean()
             sma50 = sma_series.iloc[-1]
-            sma50_prev = sma_series.iloc[-5]
+            sma50_prev = sma50_series.iloc[-5]
             atr = calculate_atr(hist, SPEC["ATR_PERIOD"])
             
-            # ロジック判定
+            # 判定ロジック
             is_uptrend = price > sma50 and sma50 > sma50_prev
             dist_sma = (price - sma50) / sma50
             
             stop = round(price - (atr * SPEC["STOP_MULT"]), 2)
             target = round(price + (atr * SPEC["TARGET_MULT"]), 2)
-            rr = round((target - price) / (price - stop), 2) if (price - stop) > 0 else -1
+            risk = price - stop
+            rr = round((target - price) / risk, 2) if risk > 0 else -1
             
-            # 分類
-            action = "除外"
-            reason = "トレンド不適合"
-            if rr < 0: action, reason = "除外", "データ不整合"
-            elif not is_uptrend: action, reason = "除外", "SMA50割れ/下向き"
-            elif rr < SPEC["RR_THRESHOLD"]: action, reason = "待機", f"R/R不足({rr:.2f})"
-            elif dist_sma > SPEC["DIP_LIMIT"]: action, reason = "監視", "乖離過大"
-            else: action, reason = "買い候補", "条件合致"
+            # RSI (0-100クリップ)
+            delta = hist['Close'].diff()
+            gain = delta.where(delta > 0, 0).rolling(14).mean()
+            loss = -delta.where(delta < 0, 0).rolling(14).mean()
+            rsi = (100 - (100 / (1 + (gain / loss)))).clip(0, 100).iloc[-1]
+
+            # 分類 & 要約生成 (仕様2-3, 4)
+            if rr < 0 or np.isnan(rsi):
+                cat, reason, act = LBL["CAT_EXCL"], "データ不整合", LBL["ACT_NONE"]
+                cond_summary = "計算不能"
+            elif not is_uptrend:
+                cat, reason, act = LBL["CAT_EXCL"], "トレンド不適合", LBL["ACT_NONE"]
+                cond_summary = "SMA50割れ/下向き"
+            elif rr < SPEC["RR_THRESHOLD"]:
+                cat, reason, act = LBL["CAT_WATCH"], f"R/R不足({rr:.2f})", LBL["ACT_WAIT_COND"]
+                cond_summary = "期待値不足"
+            elif rsi >= 70:
+                cat, reason, act = LBL["CAT_WATCH"], f"過熱感(RSI{rsi:.0f})", LBL["ACT_WAIT_PRICE"]
+                cond_summary = "買われすぎ"
+            elif dist_sma > SPEC["DIP_LIMIT"]:
+                cat, reason, act = LBL["CAT_WATCH"], f"乖離大(+{dist_sma*100:.1f}%)", LBL["ACT_WAIT_PRICE"]
+                cond_summary = "移動平均から遠い"
+            else:
+                cat, reason, act = LBL["CAT_BUY"], "好条件", LBL["ACT_BUY"]
+                cond_summary = "上昇中 / 押し目 / R/R合格"
 
             results.append({
-                "Run_ID": run_id, "時刻": now_jp, "銘柄": ticker, "価格": price,
-                "判定": action, "理由": reason, "損切": stop, "目標": target, "RR": rr,
-                "SMA50": sma50, "距離": dist_sma
+                "Run_ID": run_id, "時刻": now_jp, "データ日": last_date.strftime('%Y-%m-%d'),
+                "銘柄": ticker, "名称": stock.info.get('shortName', ticker), "現在値": price,
+                "判定": cat, "理由": reason, "次の行動": act, "条件要約": cond_summary,
+                "損切": stop, "目標": target, "RR": rr,
+                "SMA50": sma50, "RSI": rsi, "乖離": dist_sma
             })
         except:
-            results.append({"銘柄": ticker, "判定": "除外", "理由": "取得失敗"})
+            results.append({"銘柄": ticker, "判定": LBL["CAT_EXCL"], "理由": "取得エラー", "詳細": "API接続失敗"})
             continue
             
-    progress_text.empty()
-    bar.empty()
+    prog_text.empty()
+    prog_bar.empty()
     return pd.DataFrame(results)
 
-# --- 4. UI 構築 (要件A, C, D) ---
+# --- 4. UI 構築 ---
 
-# サイドバー: 銘柄カスタム (要件C)
+# サイドバー (要件C)
 st.sidebar.title("🦅 Setting")
-preset_choice = st.sidebar.selectbox("銘柄セット選択", list(PRESETS.keys()))
-custom_input = st.sidebar.text_area("銘柄をカスタム (カンマ区切り)", value=",".join(PRESETS[preset_choice]))
-tickers = [t.strip().upper() for t in custom_input.split(",") if t.strip()]
+preset = st.sidebar.selectbox("銘柄セットを選ぶ", list(PRESETS.keys()))
+custom_tickers = st.sidebar.text_area("銘柄を追加・編集 (カンマ区切り)", value=",".join(PRESETS[preset]))
+target_tickers = [t.strip().upper() for t in custom_tickers.split(",") if t.strip()]
 
-page = st.sidebar.radio("機能切替", ["🚀 戦略ボード", "⚙️ 過去ログ・監査室", "💬 フィードバック"])
+page = st.sidebar.radio("メニュー", ["🚀 戦略ボード", "💬 感想を送る", "⚙️ 記録・監査"])
 
-# --- 戦略ボード (要件A, B) ---
 if page == "🚀 戦略ボード":
-    st.title("🦅 Market Edge Pro v1.1")
+    st.title("🦅 Market Edge Pro v1.2")
     
-    # 使い方カード (要件A, B)
-    with st.expander("📖 はじめての方へ：このアプリの使い方と免責", expanded=True):
+    # 2-1. 3ステップ操作 & 4-2. 免責 (上部固定)
+    st.info("""
+    🔰 **使い方:** ①左で銘柄を選ぶ ➔ ②下のボタンでスキャン ➔ ③「次の行動」を確認  
+    ⚠️ **免責:** 本アプリは機械的な判定結果を表示する道具であり、投資助言ではありません。データには遅延(約15分以上)が含まれます。最終判断はご自身で行ってください。
+    """)
+    
+    # 3-1. データ情報
+    st.caption("📡 データソース: Yahoo Finance | 更新頻度: 随時 (遅延あり) | 判定足: 日足")
+
+    # 2-2. 折りたたみ説明
+    with st.expander("📖 詳しい用語解説とルールの詳細"):
         st.markdown(f"""
-        **このアプリは何をするもの？** あらかじめ決めた「短期上昇トレンドの押し目」ルールを、選んだ銘柄に機械的に当てはめて「今日何をするか」を表示する道具です。
-        
-        **用語のかんたん説明:**
-        - **損切り**: ここまで下がったら諦めて撤退する目安の価格。
-        - **目標**: ここまで上がったら一旦利確を検討する目安の価格。
-        - **利幅/損幅比 (R/R)**: リスク1に対してどれだけの利益が見込めるかの倍率（2.0以上を推奨）。
-        - **SMA50**: 過去50日の平均価格。この線より上で、線が上を向いているのが上昇トレンドの条件。
-        
-        **⚠️ 免責事項:**
-        本アプリは投資助言ではありません。計算結果を表示するツールであり、最終的な判断は必ずご自身の責任で行ってください。データには遅延や欠損が含まれる場合があります。
+        - **SMA50 (50日移動平均線):** トレンドの基準線。これより上で、線が上向きなら上昇トレンドと判定。
+        - **R/R (利幅/損幅比):** リスク1に対してリターンがいくら見込めるか。{SPEC['RR_THRESHOLD']}倍以上を合格とする。
+        - **ATR:** 1日の平均的な値動き幅。損切りや目標の計算に使用。
+        - **損切り目安:** 現在値 - (ATR × {SPEC['STOP_MULT']})
+        - **目標目安:** 現在値 + (ATR × {SPEC['TARGET_MULT']})
         """)
 
-    if st.button("🔄 市場をスキャンして行動を決める", type="primary"):
-        if not tickers: st.warning("銘柄を入力してください")
+    if st.button("🔄 市場をスキャンして結果を更新", type="primary"):
+        if not target_tickers: st.error("銘柄が入力されていません")
         else:
-            df = scan_market(tickers)
-            st.session_state['v1_1_data'] = df
+            df = scan_market(target_tickers)
+            st.session_state['v1_2_data'] = df
 
-    if 'v1_1_data' in st.session_state:
-        df = st.session_state['v1_1_data']
-        res = df['判定'].value_counts()
-        st.success(f"スキャン完了: ✅候補 {res.get('買い候補',0)} | ⏳待機/監視 {res.get('待機',0)+res.get('監視',0)} | 🗑️除外 {res.get('除外',0)}")
-        st.caption(f"ID: {df['時刻'].iloc[0]} | Run_ID: {df['Run_ID'].iloc[0]}")
-
-        t1, t2, t3 = st.tabs(["✅ 買い候補", "⏳ 待機・監視", "🗑️ 除外"])
+    # 結果表示
+    if 'v1_2_data' in st.session_state:
+        df = st.session_state['v1_2_data']
+        # 6-2. CSV保存
+        st.download_button("📥 結果をCSVで保存", convert_df(df), "market_edge_result.csv", "text/csv")
         
+        # サマリー
+        counts = df['判定'].value_counts()
+        st.markdown(f"**診断結果:** ✅候補 **{counts.get(LBL['CAT_BUY'],0)}** | ⏳監視・待機 **{counts.get(LBL['CAT_WATCH'],0)}** | 🗑️対象外 **{counts.get(LBL['CAT_EXCL'],0)}**")
+        
+        # タブ構成
+        t1, t2, t3 = st.tabs(["✅ 買い候補", "⏳ 監視・待機", "🗑️ 対象外"])
+        
+        # --- 買い候補 (6-1. R/R順) ---
         with t1:
-            buy_df = df[df['判定']=="買い候補"]
-            if buy_df.empty: st.info("現在、条件を満たす『買い候補』はありません。")
-            for _, r in buy_df.iterrows():
-                with st.container():
-                    c1, c2, c3 = st.columns([2, 1, 1])
-                    c1.markdown(f"### **{r['銘柄']}**")
-                    c2.metric("利幅/損幅比 (R/R)", f"{r['RR']:.2f}x")
-                    c3.write("**次の行動:**\n本日終値の維持を確認し発注")
-                    
-                    cc1, cc2, cc3 = st.columns(3)
-                    cc1.metric("現在値", f"${r['価格']:.2f}")
-                    cc2.metric("損切り目安", f"${r['損切']:.2f}", f"{(r['損切']-r['価格'])/r['価格']:.1%}")
-                    cc3.metric("目標目安", f"${r['目標']:.2f}", f"{(r['目標']-r['価格'])/r['価格']:.1%}")
-                    
-                    with st.expander("📊 判定の詳細根拠"):
-                        st.write(f"- トレンド: 上昇 (SMA50:${r['SMA50']:.2f} を超えて推移)")
-                        st.write(f"- 押し目状況: 良好 (SMA50から {r['距離']*100:.1f}% の位置)")
-                        st.write(f"- 理由: {r['理由']}")
-                    st.divider()
+            buy_df = df[df['判定'] == LBL['CAT_BUY']].sort_values('RR', ascending=False)
+            if buy_df.empty:
+                st.info("現在、条件（トレンド・押し目・R/R）を全て満たす銘柄はありません。無理に動かずチャンスを待ちましょう。")
+            else:
+                for _, r in buy_df.iterrows():
+                    with st.container():
+                        # ヘッダー
+                        c1, c2 = st.columns([3, 1])
+                        c1.subheader(f"{r['銘柄']} {r['名称']}")
+                        c2.caption(f"現在値: ${r['現在値']:.2f}")
+                        
+                        # 2-3. 条件要約
+                        st.caption(f"💡 条件: {r['条件要約']}")
+                        
+                        # 4-1. 次の行動
+                        st.success(f"👉 **次の行動:** {r['次の行動']}")
+                        
+                        # 数値
+                        kc1, kc2, kc3, kc4 = st.columns(4)
+                        kc1.metric("利幅/損幅(R/R)", f"{r['RR']}x")
+                        kc2.metric("損切り目安", f"${r['損切']:.2f}", f"{(r['損切']-r['現在値'])/r['現在値']:.1%}")
+                        kc3.metric("目標目安", f"${r['目標']:.2f}", f"{(r['目標']-r['現在値'])/r['現在値']:.1%}")
+                        kc4.metric("基準線(SMA50)", f"${r['SMA50']:.2f}")
+                        
+                        # 詳細
+                        with st.expander("詳細データ"):
+                            st.write(f"RSI: {r['RSI']:.0f} | 乖離: {r['乖離']:.1%} | データ日: {r['データ日']}")
+                        st.divider()
 
+        # --- 監視・待機 (6-1. 乖離順=近い順) ---
         with t2:
-            st.dataframe(df[df['判定'].isin(["待機", "監視"])][["銘柄", "判定", "理由", "価格"]], use_container_width=True, hide_index=True)
-            st.caption("※価格がSMA50付近まで調整するか、R/R条件が整うのを待ちます。")
+            watch_df = df[df['判定'] == LBL['CAT_WATCH']].sort_values('乖離')
+            if watch_df.empty: st.write("なし")
+            else:
+                st.write("※条件や価格が整うのを待つリストです。")
+                for _, r in watch_df.iterrows():
+                    with st.expander(f"**{r['銘柄']}** (${r['現在値']:.2f}) | {r['理由']}"):
+                        # 2-4. 待つ価格の明示
+                        st.warning(f"👀 **待つ目安:** ${r['SMA50']:.2f} 付近 (SMA50)")
+                        st.write(f"判定理由: {r['理由']}")
+                        st.write(f"次の行動: {r['次の行動']}")
 
+        # --- 対象外 ---
         with t3:
-            st.dataframe(df[df['判定']=="除外"][["銘柄", "理由"]], use_container_width=True, hide_index=True)
-            st.caption("※上昇トレンドが崩れているか、ボラティリティが過大です。")
+            excl_df = df[df['判定'] == LBL['CAT_EXCL']]
+            if excl_df.empty: st.write("なし")
+            else:
+                st.dataframe(excl_df[["銘柄", "理由", "次の行動"]], hide_index=True, use_container_width=True)
 
-# --- 過去ログ・分析室 ---
-elif page == "⚙️ 記録・監査室":
-    st.title("⚙️ 過去の実行記録")
-    if os.path.exists(HISTORY_FILE):
-        hist = pd.read_csv(HISTORY_FILE)
-        st.dataframe(hist.sort_index(ascending=False), use_container_width=True, hide_index=True)
-        st.caption(f"Verification Code: {get_verification_code()}")
-    else: st.info("履歴がありません")
+# --- フィードバック (要件5) ---
+elif page == "💬 感想を送る":
+    st.title("💬 改善フィードバック")
+    st.write("使いにくい点や、欲しい機能があれば教えてください。Run_ID等が自動添付されます。")
+    
+    # 5-1. テンプレボタン
+    col_fb1, col_fb2 = st.columns(2)
+    fb_template = ""
+    if col_fb1.button("「分かりにくい」を送る"):
+        fb_template = "【分かりにくい点】\n・\n\n【どの画面で】\n・"
+    if col_fb2.button("「機能要望」を送る"):
+        fb_template = "【欲しい機能】\n・\n\n【なぜ必要か】\n・"
 
-# --- フィードバック (要件D) ---
-elif page == "💬 フィードバック":
-    st.title("💬 改善へのご協力")
-    st.write("NOTEでの公開をより良くするため、ご感想や不具合報告をお聞かせください。")
-    with st.form("feedback_form"):
-        sentiment = st.select_slider("このアプリの満足度は？", options=["😞", "😐", "🙂", "🤩"])
-        comment = st.text_area("感想・要望・不具合報告（Run_IDが自動添付されます）")
-        submitted = st.form_submit_button("送信する")
+    with st.form("fb_form"):
+        sentiment = st.selectbox("満足度", ["普通", "良い", "とても良い", "使いにくい"])
+        comment = st.text_area("内容", value=fb_template, height=150)
+        submitted = st.form_submit_button("送信")
+        
         if submitted:
-            run_id = st.session_state.get('v1_1_data', pd.DataFrame([{'Run_ID':'N/A'}]))['Run_ID'].iloc[0]
-            log_feedback(run_id, sentiment, comment)
-            st.success("ありがとうございます！いただいた内容は大切に確認し、改善に役立てます。")
+            # 5-2. 自動付与データ
+            meta_info = {
+                "Ver": VERSION,
+                "Run_ID": st.session_state.get('v1_2_data', pd.DataFrame({'Run_ID':['N/A']}))['Run_ID'].iloc[0],
+                "Preset": preset,
+                "Tickers_Count": len(target_tickers)
+            }
+            log_feedback(f"{sentiment} | {comment} | {meta_info}")
+            st.success("送信しました。開発の参考にさせていただきます！")
+
+# --- 過去ログ ---
+elif page == "⚙️ 記録・監査":
+    st.title("⚙️ 過去ログ")
+    if os.path.exists(HISTORY_FILE):
+        st.dataframe(pd.read_csv(HISTORY_FILE).sort_index(ascending=False))
+        st.caption(f"Verification: {get_verification_code()}")
+    else: st.info("履歴なし")
