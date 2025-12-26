@@ -3,6 +3,7 @@ import sqlite3
 import pandas as pd
 import os
 import time
+import yfinance as yf # 追加: 株価取得用
 
 try: from data.init_db import init_db
 except ImportError:
@@ -23,11 +24,29 @@ def ensure_db():
 def run_init(m):
     with st.spinner(m): init_db(); time.sleep(1); st.rerun()
 
-def main():
-    st.title("Market Edge Pro") # バージョン表記も消してシンプルに
-    ensure_db()
+# --- 追加: 市場データを取得する関数 ---
+@st.cache_data(ttl=600) # 10分間キャッシュして高速化
+def get_market_status():
+    try:
+        # S&P 500のティッカーは ^GSPC
+        ticker = yf.Ticker("^GSPC")
+        # 過去2日分のデータを取得（前日比を出すため）
+        hist = ticker.history(period="2d")
+        
+        if len(hist) < 2:
+            return "N/A", "0.00"
+        
+        current_price = hist['Close'].iloc[-1]
+        prev_close = hist['Close'].iloc[-2]
+        delta = current_price - prev_close
+        delta_percent = (delta / prev_close) * 100
+        
+        return f"{current_price:,.2f}", f"{delta:+.2f} ({delta_percent:+.2f}%)"
+    except:
+        return "Error", "0.00"
 
-    # --- プロ仕様: 利用規約同意チェック ---
+def main():
+    # 利用規約チェック
     if "tos_agreed" not in st.session_state:
         st.session_state.tos_agreed = False
 
@@ -45,18 +64,23 @@ def main():
             st.session_state.tos_agreed = True
             st.rerun()
         else:
-            st.stop() # 同意しないと先に進めない
+            st.stop()
 
-    # --- 本番ダッシュボード ---
+    st.title("Market Edge Pro")
+    ensure_db()
+
+    # ★修正: リアルタイムデータの取得
+    sp500_price, sp500_delta = get_market_status()
+
     st.markdown("---")
     
     c1, c2, c3 = st.columns(3)
     
     with c1:
         st.subheader("📊 市場ステータス")
-        # 本来はここもAPIで取るが、今回は静的表示でデザインを優先
-        st.metric("S&P 500", "4,780.20", "+0.5%")
-        st.caption("Market Status: OPEN")
+        # ここに変数をセット
+        st.metric("S&P 500", sp500_price, sp500_delta)
+        st.caption("Data: Yahoo Finance (Delayed)")
     
     with c2:
         st.subheader("👁 監視リスト")
