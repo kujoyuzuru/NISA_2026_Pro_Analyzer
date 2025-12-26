@@ -8,19 +8,18 @@ import yfinance as yf
 import ta
 
 # --- セットアップ ---
-# ページ設定でアイコンとタイトルを指定
 st.set_page_config(
     page_title="Market Edge Pro",
     page_icon="📊",
     layout="wide",
-    initial_sidebar_state="collapsed" # スマホで見やすいようサイドバーは閉じておく
+    initial_sidebar_state="collapsed"
 )
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if BASE_DIR not in sys.path: sys.path.append(BASE_DIR)
 DB_PATH = os.path.join(BASE_DIR, "trading_journal.db")
 
-# --- 銘柄マスターデータ (省略なし) ---
+# --- 銘柄マスターデータ ---
 STOCK_MASTER = {
     "SPY": {"name": "SPDR S&P 500", "sector": "INDEX: S&P500"},
     "QQQ": {"name": "Invesco QQQ", "sector": "INDEX: NASDAQ100"},
@@ -105,7 +104,7 @@ def save_watchlist(name, symbols_list):
     except: return []
     finally: conn.close()
 
-# --- 分析ロジック (リアルタイム・高精度版) ---
+# --- 分析ロジック ---
 @st.cache_data(ttl=15)
 def analyze_stocks_pro(symbols):
     if not symbols: return pd.DataFrame()
@@ -126,8 +125,6 @@ def analyze_stocks_pro(symbols):
 
             current_close = float(sdf['Close'].iloc[-1])
             prev_close = float(sdf['Close'].iloc[-2])
-            
-            # 前日比の計算（パーセント）
             change_val = current_close - prev_close
             change_pct = (change_val / prev_close) * 100
             
@@ -145,12 +142,22 @@ def analyze_stocks_pro(symbols):
                 if rsi < 30: verdict, score = "△ リバウンド狙い", 40
                 else: verdict, score = "× 様子見", 0
 
+            # 理由を明確化
+            reason_short = ""
+            if rsi < 35: reason_short = "売られすぎ"
+            elif rsi > 70: reason_short = "買われすぎ"
+            elif trend_up: reason_short = "トレンド順行"
+            else: reason_short = "トレンド逆行"
+
             results.append({
                 "Symbol": sym,
                 "Price": current_close,
                 "Change": change_pct,
+                "RSI": rsi,
+                "Trend": "📈 上昇" if trend_up else "📉 下降",
                 "Verdict": verdict,
-                "Score": score
+                "Score": score,
+                "Reason": reason_short
             })
         except: continue
     
@@ -159,18 +166,14 @@ def analyze_stocks_pro(symbols):
         df_res = df_res.sort_values(by="Score", ascending=False)
     return df_res
 
-# --- スタイリング関数 ---
+# --- スタイリング ---
 def color_change_text(val):
-    """前日比の数値に基づいてテキスト色を変える"""
-    if pd.isna(val):
-        return 'color: white'
-    # アイキャッチ画像に合わせた鮮やかな色設定
-    color = '#00FF00' if val >= 0 else '#FF0000' 
+    if pd.isna(val): return 'color: white'
+    color = '#00FF00' if val >= 0 else '#FF0000'
     return f'color: {color}'
 
 # --- メイン画面 ---
 def main():
-    # アイキャッチ画像と同じロゴとタイトルをヘッダーとして表示
     st.markdown("""
         <h1 style='text-align: center; margin-bottom: 20px;'>
             📊 Market Edge Pro
@@ -181,14 +184,12 @@ def main():
     if df.empty: st.warning("DBエラー"); return
     curr_list = [s.strip().upper() for s in df.iloc[0]['symbols'].split(",") if s.strip()]
 
-    # スマホでの表示を意識し、メインコンテンツを中央寄せにする
     col_main, = st.columns([1])
 
     with col_main:
         if not curr_list:
              st.info("👈 サイドバーから監視銘柄を追加してください")
         else:
-            # ダッシュボードのヘッダーと更新ボタン
             c_head, c_btn = st.columns([3, 1])
             with c_head:
                 st.subheader("AI 売買判断ダッシュボード")
@@ -201,30 +202,62 @@ def main():
                 df_anl = analyze_stocks_pro(curr_list)
 
             if not df_anl.empty:
-                # --- アイキャッチ画像のテーブル再現 ---
+                # 1. 表示用データフレームの作成
+                display_df = df_anl[["Verdict", "Symbol", "Price", "Change", "RSI", "Trend"]].copy()
+                display_df.columns = ["Verdict", "Symbol", "Price", "Change", "RSI (過熱感)", "Trend"]
                 
-                # 1. 表示用のDataFrameを作成（カラム名に改行を入れて狭い幅に対応）
-                display_df = df_anl[["Verdict", "Symbol", "Price", "Change"]].copy()
-                display_df.columns = ["Verdict\n(AI判定)", "Symbol\n(銘柄)", "Price\n(現在値)", "Change\n(前日比)"]
-                
-                # 2. Pandas Stylerで色とフォーマットを適用
-                styled_df = display_df.style.format({
-                    "Price\n(現在値)": "${:,.2f}",
-                    "Change\n(前日比)": "{:+.2f}%"
-                }).map(color_change_text, subset=["Change\n(前日比)"])
-
-                # 3. Streamlitで表示（高さを固定してスマホで見やすく）
+                # 2. StreamlitのColumnConfigを使ってビジュアル化
+                # ここが「信頼」を作るカギです：理論を視覚化する
                 st.dataframe(
-                    styled_df,
+                    display_df.style.format({
+                        "Price": "${:,.2f}",
+                        "Change": "{:+.2f}%",
+                    }).map(color_change_text, subset=["Change"]),
+                    
+                    column_config={
+                        "Verdict": st.column_config.TextColumn("AI判定", width="medium"),
+                        "Symbol": st.column_config.TextColumn("銘柄", width="small"),
+                        "Price": st.column_config.NumberColumn("現在値", format="$%.2f"),
+                        "Change": st.column_config.NumberColumn("前日比", format="%.2f%%"),
+                        
+                        # ★ここが追加ポイント: RSIをバーで見せる
+                        "RSI (過熱感)": st.column_config.ProgressColumn(
+                            "RSI (過熱感)",
+                            help="売られすぎ(0) <---> 買われすぎ(100)。30以下は買いシグナル、70以上は売り警戒。",
+                            format="%d",
+                            min_value=0,
+                            max_value=100,
+                        ),
+                        # トレンドをわかりやすく
+                        "Trend": st.column_config.TextColumn("トレンド", width="small"),
+                    },
                     hide_index=True,
                     use_container_width=True,
                     height=600
                 )
                 
+                # 3. 理論の解説セクション（ブラックボックスを開示する）
+                with st.expander("💡 なぜこの判断なのか？ (AIロジックの解説)"):
+                    st.markdown("""
+                    このアプリは、プロの投資家が使う**2つの「王道理論」**を組み合わせて自動判定しています。
+                    
+                    #### 1. トレンド判定：グランビルの法則 (SMA50)
+                    * **仕組み:** 過去50日の平均価格（SMA50）より、現在の株価が「上」にあれば**「上昇トレンド」**とみなします。
+                    * **意味:** 「株価は波を描きながらトレンド方向に進む」という理論に基づき、上昇中の株のみをターゲットにします。
+                    
+                    #### 2. タイミング判定：RSI (相対力指数)
+                    * **仕組み:** 「買われすぎ」「売られすぎ」を0〜100の数値で測ります。
+                    * **意味:** 上昇トレンド中にRSIが低くなった瞬間（押し目）は、**「一時的に安くなっているだけ」**なので、絶好の買い場となります。
+                    
+                    **判定の根拠:**
+                    * 💎 **超・買い時:** 上昇トレンド中 ＋ RSI < 35 (暴落レベルの安値)
+                    * ◎ **押し目買い:** 上昇トレンド中 ＋ RSI < 50 (過熱感なし)
+                    * ⚡ **利確検討:** RSI > 75 (加熱しすぎ。反落警戒)
+                    """)
+                
             else:
                 st.error("データ取得失敗。時間をおいて再試行してください。")
     
-    # 銘柄管理はサイドバーに移動（スマホではメニューから開く）
     with st.sidebar:
         st.header("🛠 銘柄管理")
         def fmt(t):
