@@ -8,12 +8,19 @@ import yfinance as yf
 import ta
 
 # --- セットアップ ---
-st.set_page_config(page_title="Watchlist Pro", layout="wide")
+# ページ設定でアイコンとタイトルを指定
+st.set_page_config(
+    page_title="Market Edge Pro",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="collapsed" # スマホで見やすいようサイドバーは閉じておく
+)
+
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if BASE_DIR not in sys.path: sys.path.append(BASE_DIR)
 DB_PATH = os.path.join(BASE_DIR, "trading_journal.db")
 
-# --- 銘柄マスターデータ ---
+# --- 銘柄マスターデータ (省略なし) ---
 STOCK_MASTER = {
     "SPY": {"name": "SPDR S&P 500", "sector": "INDEX: S&P500"},
     "QQQ": {"name": "Invesco QQQ", "sector": "INDEX: NASDAQ100"},
@@ -98,15 +105,12 @@ def save_watchlist(name, symbols_list):
     except: return []
     finally: conn.close()
 
-# --- 分析ロジック (高精度版) ---
-# ★修正: ttlを15秒に短縮してほぼリアルタイム化。データ取得方法も改善。
+# --- 分析ロジック (リアルタイム・高精度版) ---
 @st.cache_data(ttl=15)
 def analyze_stocks_pro(symbols):
     if not symbols: return pd.DataFrame()
     tickers_str = " ".join(symbols)
-    
     try:
-        # データ取得：期間を長めにとってSMA計算用のデータを確保
         df_hist = yf.download(tickers_str, period="6mo", interval="1d", group_by='ticker', auto_adjust=True, progress=False)
     except: return pd.DataFrame()
 
@@ -118,47 +122,34 @@ def analyze_stocks_pro(symbols):
                 if sym not in df_hist: continue
                 sdf = df_hist[sym]
             
-            # データ不足チェック
             if sdf.empty or len(sdf) < 50: continue
 
-            # --- 値の取得（最新と1つ前） ---
-            # iloc[-1] が「今日（現在進行形）」、iloc[-2] が「昨日（確定）」
             current_close = float(sdf['Close'].iloc[-1])
             prev_close = float(sdf['Close'].iloc[-2])
             
-            # ★修正: 正確な前日比計算
+            # 前日比の計算（パーセント）
             change_val = current_close - prev_close
             change_pct = (change_val / prev_close) * 100
             
-            # テクニカル指標
             sma50 = ta.trend.SMAIndicator(sdf['Close'], window=50).sma_indicator().iloc[-1]
             rsi = ta.momentum.RSIIndicator(sdf['Close'], window=14).rsi().iloc[-1]
-            
             trend_up = current_close > sma50
             
-            # 判定ロジック
-            verdict, reason, score = "", "", 0
+            verdict, score = "", 0
             if trend_up:
-                if rsi < 35: verdict, reason, score = "💎 超・買い時", "上昇トレンド中の暴落", 100
-                elif rsi < 50: verdict, reason, score = "◎ 押し目買い", "トレンド上向き+過熱感なし", 80
-                elif rsi > 75: verdict, reason, score = "⚡ 利確検討", "買われすぎ警戒", -10
-                else: verdict, reason, score = "○ 保有/継続", "順調に推移中", 50
+                if rsi < 35: verdict, score = "💎 超・買い時", 100
+                elif rsi < 50: verdict, score = "◎ 押し目買い", 80
+                elif rsi > 75: verdict, score = "⚡ 利確検討", -10
+                else: verdict, score = "○ 保有/継続", 50
             else:
-                if rsi < 30: verdict, reason, score = "△ リバウンド狙い", "売られすぎ(逆張り)", 40
-                else: verdict, reason, score = "× 様子見", "下降トレンド中", 0
+                if rsi < 30: verdict, score = "△ リバウンド狙い", 40
+                else: verdict, score = "× 様子見", 0
 
-            meta = STOCK_MASTER.get(sym, {"name": sym, "sector": "Others"})
-            
             results.append({
                 "Symbol": sym,
-                "Name": meta["name"],
-                "Sector": meta["sector"],
                 "Price": current_close,
-                "Change": change_pct, # パーセント値そのもの
-                "RSI": rsi,
-                "Trend": "📈" if trend_up else "📉",
+                "Change": change_pct,
                 "Verdict": verdict,
-                "Reason": reason,
                 "Score": score
             })
         except: continue
@@ -168,91 +159,85 @@ def analyze_stocks_pro(symbols):
         df_res = df_res.sort_values(by="Score", ascending=False)
     return df_res
 
+# --- スタイリング関数 ---
+def color_change_text(val):
+    """前日比の数値に基づいてテキスト色を変える"""
+    if pd.isna(val):
+        return 'color: white'
+    # アイキャッチ画像に合わせた鮮やかな色設定
+    color = '#00FF00' if val >= 0 else '#FF0000' 
+    return f'color: {color}'
+
 # --- メイン画面 ---
 def main():
-    st.title("⚡ 監視リスト & 売買シグナル")
+    # アイキャッチ画像と同じロゴとタイトルをヘッダーとして表示
+    st.markdown("""
+        <h1 style='text-align: center; margin-bottom: 20px;'>
+            📊 Market Edge Pro
+        </h1>
+    """, unsafe_allow_html=True)
     
-    # DB読み込み
     df = load_watchlist()
-    if df.empty: st.warning("DBエラー: リストが読み込めません"); return
+    if df.empty: st.warning("DBエラー"); return
     curr_list = [s.strip().upper() for s in df.iloc[0]['symbols'].split(",") if s.strip()]
 
-    col1, col2 = st.columns([1, 2.5])
-    
-    # 左サイド
-    with col1:
-        with st.container(border=True):
-            st.subheader("🛠 銘柄管理")
-            
-            def fmt(t):
-                m = STOCK_MASTER.get(t)
-                return f"{t} | {m['name']} ({m['sector']})" if m else t
+    # スマホでの表示を意識し、メインコンテンツを中央寄せにする
+    col_main, = st.columns([1])
 
-            merged_opts = POPULAR_ORDER + [x for x in curr_list if x not in POPULAR_ORDER]
-            
-            sel = st.multiselect(
-                "監視リストに追加", 
-                options=merged_opts, 
-                default=curr_list, 
-                format_func=fmt,
-                placeholder="銘柄を検索..."
-            )
-            
-            manual = st.text_input("手動追加", placeholder="例: GME")
-            
-            # ボタン: キャッシュをクリアして強制更新
-            if st.button("リストを保存して更新", type="primary", use_container_width=True):
-                final = sel.copy()
-                if manual: final.extend([x.strip().upper() for x in manual.split(',')])
-                save_watchlist(df.iloc[0]['name'], final)
-                st.cache_data.clear() # ★修正: 保存時にキャッシュを全クリア
-                st.rerun()
-
-    # 右サイド
-    with col2:
+    with col_main:
         if not curr_list:
-            st.info("👈 左側で銘柄を選んでください")
+             st.info("👈 サイドバーから監視銘柄を追加してください")
         else:
+            # ダッシュボードのヘッダーと更新ボタン
             c_head, c_btn = st.columns([3, 1])
             with c_head:
-                st.subheader("📊 AI 売買判断ダッシュボード")
+                st.subheader("AI 売買判断ダッシュボード")
             with c_btn:
-                # ★追加: 手動更新ボタン
-                if st.button("🔄 最新データ取得"):
+                if st.button("🔄 更新"):
                     st.cache_data.clear()
                     st.rerun()
 
-            with st.spinner("市場データを取得中..."):
+            with st.spinner("市場データを分析中..."):
                 df_anl = analyze_stocks_pro(curr_list)
 
             if not df_anl.empty:
-                buy_c = len(df_anl[df_anl["Score"] >= 80])
-                alert_c = len(df_anl[df_anl["Score"] < 0])
+                # --- アイキャッチ画像のテーブル再現 ---
                 
-                m1, m2, m3 = st.columns(3)
-                m1.metric("買い推奨", f"{buy_c} 銘柄", delta="Chance" if buy_c > 0 else "None")
-                m2.metric("過熱/警戒", f"{alert_c} 銘柄", delta="Alert" if alert_c > 0 else "None", delta_color="inverse")
-                m3.caption(f"最終更新: {time.strftime('%H:%M:%S')}")
+                # 1. 表示用のDataFrameを作成（カラム名に改行を入れて狭い幅に対応）
+                display_df = df_anl[["Verdict", "Symbol", "Price", "Change"]].copy()
+                display_df.columns = ["Verdict\n(AI判定)", "Symbol\n(銘柄)", "Price\n(現在値)", "Change\n(前日比)"]
+                
+                # 2. Pandas Stylerで色とフォーマットを適用
+                styled_df = display_df.style.format({
+                    "Price\n(現在値)": "${:,.2f}",
+                    "Change\n(前日比)": "{:+.2f}%"
+                }).map(color_change_text, subset=["Change\n(前日比)"])
 
+                # 3. Streamlitで表示（高さを固定してスマホで見やすく）
                 st.dataframe(
-                    df_anl,
-                    column_order=["Verdict", "Symbol", "Sector", "Price", "Change", "RSI", "Trend", "Reason"],
-                    column_config={
-                        "Verdict": st.column_config.TextColumn("AI判定", width="medium"),
-                        "Symbol": st.column_config.TextColumn("銘柄", width="small"),
-                        "Sector": st.column_config.TextColumn("セクター", width="small"),
-                        "Price": st.column_config.NumberColumn("現在値", format="$%.2f"),
-                        # ★修正: 前日比に色付けをして見やすく
-                        "Change": st.column_config.NumberColumn("前日比", format="%.2f%%"),
-                        "RSI": st.column_config.ProgressColumn("RSI (過熱感)", format="%d", min_value=0, max_value=100),
-                        "Trend": st.column_config.TextColumn("傾向", width="small"),
-                        "Reason": st.column_config.TextColumn("分析コメント", width="medium"),
-                    },
+                    styled_df,
                     hide_index=True,
                     use_container_width=True,
                     height=600
                 )
+                
             else:
-                st.error("データの取得に失敗しました。時間をおいて「最新データ取得」を押してください。")
+                st.error("データ取得失敗。時間をおいて再試行してください。")
+    
+    # 銘柄管理はサイドバーに移動（スマホではメニューから開く）
+    with st.sidebar:
+        st.header("🛠 銘柄管理")
+        def fmt(t):
+            m = STOCK_MASTER.get(t)
+            return f"{t} | {m['name']} ({m['sector']})" if m else t
+        merged_opts = POPULAR_ORDER + [x for x in curr_list if x not in POPULAR_ORDER]
+        sel = st.multiselect("監視リスト", options=merged_opts, default=curr_list, format_func=fmt, placeholder="銘柄を検索...")
+        manual = st.text_input("手動追加", placeholder="例: GME")
+        if st.button("リストを保存して更新", type="primary", use_container_width=True):
+            final = sel.copy()
+            if manual: final.extend([x.strip().upper() for x in manual.split(',')])
+            save_watchlist(df.iloc[0]['name'], final)
+            st.cache_data.clear()
+            st.rerun()
 
 if __name__ == "__main__": main()
