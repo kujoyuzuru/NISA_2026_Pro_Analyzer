@@ -4,11 +4,10 @@ import pandas as pd
 import os
 import time
 
-# dataフォルダのinit_dbを読み込む
+# dataフォルダのinit_dbを読み込む。パスが見つからない場合の保険付き
 try:
     from data.init_db import init_db
 except ImportError:
-    # パスが解決できない場合の保険（絶対パスで再トライ）
     import sys
     sys.path.append(os.path.abspath(os.path.dirname(__file__)))
     from data.init_db import init_db
@@ -24,50 +23,52 @@ st.set_page_config(
 def get_connection():
     return sqlite3.connect("trading_journal.db")
 
-# ★追加：DBが壊れていないかチェックして修復する関数★
+# ★ここが修復機能★
+# 起動時にDBの中身をチェックし、空っぽならテーブルを作成する
 def ensure_db_initialized():
     db_path = "trading_journal.db"
     
-    # 1. ファイルがない場合 -> 作成
+    # ケース1: ファイル自体がない -> 作成
     if not os.path.exists(db_path):
-        return run_init("データベースが見つかりません。新規作成します...")
+        return run_init("データベースファイルが見つかりません。新規作成します...")
 
-    # 2. ファイルはあるが、テーブルがない場合（今回のエラーはここ） -> 再作成
+    # ケース2: ファイルはあるが中身（テーブル）がない -> 再作成
     try:
         conn = get_connection()
-        conn.execute("SELECT count(*) FROM watchlists") # テストクエリ
+        # わざとテーブルを読みに行ってみる
+        conn.execute("SELECT count(*) FROM watchlists") 
         conn.close()
     except sqlite3.OperationalError:
-        # テーブルがないエラーが出たら、再作成する
-        return run_init("データベースの中身が空です。テーブルを作成します...")
+        # 「そんなテーブルないよ」と言われたら、ここに来る
+        return run_init("データベースの中身が空でした。テーブルを作成します...")
     except Exception as e:
-        return run_init(f"DBエラー検知 ({e})。再構築します...")
+        return run_init(f"DBエラーを検知しました ({e})。初期化します...")
 
 def run_init(msg):
     with st.spinner(msg):
-        init_db()
+        init_db() # ここで data/init_db.py を実行
         st.success("セットアップ完了！")
         time.sleep(1)
         st.rerun()
 
-# メイン処理
+# メイン画面の表示
 def main():
     st.title("Market Edge Pro v1.0")
     
-    # 起動時に必ずDBチェックを行う
+    # ★重要：ここで必ずチェックを実行★
     ensure_db_initialized()
 
     st.markdown("---")
 
     col1, col2, col3 = st.columns(3)
 
-    # 左カラム：市場ステータス
+    # 左：市場情報
     with col1:
         st.subheader("📊 Market Status")
         st.info("Market Open (Simulation)")
         st.metric("S&P 500", "4,780.20", "+0.5%")
 
-    # 中央カラム：監視リスト情報
+    # 中：監視リスト
     with col2:
         st.subheader("👁 Watchlist")
         try:
@@ -86,7 +87,7 @@ def main():
         except Exception as e:
             st.error(f"読み込みエラー: {e}")
 
-    # 右カラム：リスク管理
+    # 右：リスク設定
     with col3:
         st.subheader("🛡 Risk Rules")
         st.write("Daily Loss Limit: **$200**")
