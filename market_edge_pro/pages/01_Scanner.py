@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import yfinance as yf
-import alpaca_trade_api as tradeapi
+import requests  # ★ライブラリの代わりにこれを使う
 import json
 import os
 import sqlite3
@@ -25,54 +25,82 @@ if not os.path.exists(LOGIC_PATH) or not os.path.exists(RULES_PATH):
 try: from core.logic import RuleEngine
 except ImportError: st.error("System Error: Engine load failed."); st.stop()
 
-# --- プロ仕様: データ取得クラス ---
+# --- プロ仕様: データ取得クラス (Lightweight) ---
 class DataProvider:
     def __init__(self):
-        # Streamlit Secrets または 環境変数からキーを取得
+        # APIキー取得
         self.api_key = os.getenv("ALPACA_API_KEY") or st.secrets.get("ALPACA_API_KEY")
         self.api_secret = os.getenv("ALPACA_SECRET_KEY") or st.secrets.get("ALPACA_SECRET_KEY")
         self.use_alpaca = bool(self.api_key and self.api_secret)
-        self.source_name = "Alpaca (IEX Real-time)" if self.use_alpaca else "Yahoo Finance (Delayed)"
+        self.source_name = "Alpaca (Official Data)" if self.use_alpaca else "Yahoo Finance (Backup)"
 
     def fetch(self, symbols):
-        """ハイブリッドデータ取得: Alpaca優先 -> Yahooフォールバック"""
+        """ハイブリッドデータ取得"""
         if self.use_alpaca:
             try:
-                return self._fetch_alpaca(symbols)
+                return self._fetch_alpaca_direct(symbols)
             except Exception as e:
-                st.warning(f"Alpaca API Error: {e}. Switching to Backup Source.")
+                st.warning(f"Alpaca Connection Failed: {e}. Switching to Backup.")
                 self.source_name = "Yahoo Finance (Backup)"
                 return self._fetch_yahoo(symbols)
         else:
             return self._fetch_yahoo(symbols)
 
-    def _fetch_alpaca(self, symbols):
-        # Alpaca API接続
-        api = tradeapi.REST(self.api_key, self.api_secret, base_url='https://paper-api.alpaca.markets', api_version='v2')
+    def _fetch_alpaca_direct(self, symbols):
+        """ライブラリを使わず直接APIを叩く（高速・エラーなし）"""
         data_map = {}
+        # Alpaca Data API v2 Endpoint
+        url = "https://data.alpaca.markets/v2/stocks/bars"
         
-        # 日足取得（過去200日分あればSMA50/200計算可能）
-        # 無料プランの制限を考慮し、少し余裕を持つ
-        end_dt = datetime.now() - timedelta(minutes=15) # 15分遅延対策
+        headers = {
+            "APCA-API-KEY-ID": self.api_key,
+            "APCA-API-SECRET-KEY": self.api_secret,
+            "accept": "application/json"
+        }
+        
+        # 過去データの期間設定
+        end_dt = datetime.now()
         start_dt = end_dt - timedelta(days=300)
         
-        for sym in symbols:
-            try:
-                bars = api.get_bars(sym, tradeapi.TimeFrame.Day, start=start_dt.isoformat(), end=end_dt.isoformat(), limit=200).df
-                if bars.empty or len(bars) < 50: continue
-                
-                # 指標計算
-                close = float(bars['close'].iloc[-1])
-                sma50 = ta.trend.SMAIndicator(bars['close'], window=50).sma_indicator().iloc[-1]
-                rsi14 = ta.momentum.RSIIndicator(bars['close'], window=14).rsi().iloc[-1]
-                vol = float(bars['volume'].iloc[-1])
-                
-                data_map[sym] = {
-                    "symbol": sym, "price": close, "close": close,
-                    "sma": sma50, "rsi": rsi14, "volume": vol,
-                    "timestamp": datetime.now().strftime("%H:%M:%S")
-                }
-            except: continue
+        # パラメータ設定
+        params = {
+            "symbols": ",".join(symbols),
+            "timeframe": "1Day",
+            "start": start_dt.strftime("%Y-%m-%d"),
+            "end": end_dt.strftime("%Y-%m-%d"),
+            "limit": 1000,
+            "adjustment": "raw",
+            "feed": "iex"  # 無料プラン用データフィード
+        }
+
+        response = requests.get(url, headers=headers, params=params, timeout=10)
+        
+        if response.status_code != 200:
+            raise Exception(f"API Error {response.status_code}: {response.text}")
+
+        json_data = response.json()
+        bars_data = json_data.get("bars", {})
+
+        for sym, bars in bars_data.items():
+            if not bars or len(bars) < 50: continue
+            
+            # DataFrameに変換
+            df = pd.DataFrame(bars)
+            # カラム名を統一 (Alpaca: c->Close, v->Volume)
+            df = df.rename(columns={"c": "Close", "v": "Volume"})
+            
+            # 指標計算
+            close = float(df['Close'].iloc[-1])
+            sma50 = ta.trend.SMAIndicator(df['Close'], window=50).sma_indicator().iloc[-1]
+            rsi14 = ta.momentum.RSIIndicator(df['Close'], window=14).rsi().iloc[-1]
+            vol = float(df['Volume'].iloc[-1])
+            
+            data_map[sym] = {
+                "symbol": sym, "price": close, "close": close,
+                "sma": sma50, "rsi": rsi14, "volume": vol,
+                "timestamp": datetime.now().strftime("%H:%M:%S")
+            }
+        
         return data_map
 
     def _fetch_yahoo(self, symbols):
@@ -103,7 +131,6 @@ class DataProvider:
 
 # --- メイン画面 ---
 def main():
-    # 同意チェック（セッション共有）
     if not st.session_state.get("tos_agreed", False):
         st.warning("⚠️ ホーム画面に戻り、利用規約に同意してください。")
         st.stop()
@@ -117,7 +144,7 @@ def main():
         conn.close()
         if w_df.empty: st.warning("監視リストが空です"); return
         targets = w_df.iloc[0]['symbols'].split(',')
-    except: st.error("System Error: DB Connection failed."); return
+    except: st.error("System Error: DB Connection Failed"); return
 
     # ルール読み込み
     with open(RULES_PATH, "r", encoding='utf-8') as f:
@@ -131,8 +158,7 @@ def main():
         op_txt = op_map.get(c["operator"], c["operator"])
         rule_descs.append(f"- **{c['name']}**: {target_val} {op_txt}")
 
-    # UI: 設定パネル（シンプル化）
-    with st.expander("⚙️ 適用ストラテジー詳細", expanded=False): # 本番なのでデフォルトは閉じる
+    with st.expander("⚙️ 適用ストラテジー詳細", expanded=False):
         c1, c2 = st.columns([1, 2])
         with c1:
             st.markdown(f"**監視対象:** `{w_df.iloc[0]['name']}`")
@@ -141,11 +167,8 @@ def main():
             st.markdown(f"**ロジック名:** `{rule_set['name']}`")
             st.markdown("\n".join(rule_descs))
 
-    # スキャン実行
     if st.button("スキャン実行 (Start Scan)", type="primary"):
         st.divider()
-        
-        # データプロバイダー初期化
         provider = DataProvider()
         engine = RuleEngine()
         results = []
@@ -157,7 +180,6 @@ def main():
             st.error("データ取得に失敗しました。市場が閉じているか、接続エラーです。")
             return
 
-        # ソースの明示（信頼性担保）
         st.caption(f"ℹ️ Data Source: {provider.source_name} | Fetched at: {datetime.now().strftime('%H:%M:%S')}")
 
         prog = st.progress(0)
@@ -180,7 +202,7 @@ def main():
 
             results.append({
                 "Symbol": sym,
-                "Signal": "🟢 ENTRY" if is_match else "WAIT", # より実戦的な表現へ
+                "Signal": "🟢 ENTRY" if is_match else "WAIT",
                 "Price": f"${data['price']:.2f}",
                 "RSI": f"{data['rsi']:.1f}",
                 "Note": reason,
@@ -188,7 +210,6 @@ def main():
             })
         time.sleep(0.2); prog.empty()
 
-        # 結果表示
         df_r = pd.DataFrame(results)
         candidates = df_r[df_r["Signal"] == "🟢 ENTRY"]
         unmatched = df_r[df_r["Signal"] != "🟢 ENTRY"]
