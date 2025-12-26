@@ -109,37 +109,28 @@ def save_watchlist(name, symbols_list):
 def analyze_stocks_pro(symbols):
     if not symbols: return pd.DataFrame()
     
-    # 1. テクニカル指標用のデータ取得（これはまとめて取るのが速い）
-    # ※ここは「分析（RSI/SMA）」のためだけに使う
     tickers_str = " ".join(symbols)
     try:
         df_hist = yf.download(tickers_str, period="6mo", interval="1d", group_by='ticker', auto_adjust=True, progress=False)
     except: return pd.DataFrame()
 
-    # 2. 正確な現在価格を取得するためのTickerオブジェクト群
-    # ※ここがポイント：downloadではなくTickersオブジェクトを使う
     tickers_obj = yf.Tickers(tickers_str)
 
     results = []
     for sym in symbols:
         try:
-            # --- A. 正確な価格データの取得 (Fast Info) ---
-            # チャートから計算するのではなく、取引所のメタデータを直接読む
+            # --- A. 正確な価格データの取得 ---
             try:
                 info = tickers_obj.tickers[sym].fast_info
                 current_price = info.last_price
                 prev_close = info.previous_close
+                if current_price is None or prev_close is None: continue
                 
-                if current_price is None or prev_close is None:
-                    continue # データが取れない場合はスキップ
-                
-                # これが「証券会社と同じ」計算式
                 change_val = current_price - prev_close
                 change_pct = (change_val / prev_close) * 100
-            except:
-                continue
+            except: continue
 
-            # --- B. テクニカル指標の計算 (History) ---
+            # --- B. テクニカル指標 ---
             if len(symbols) == 1: sdf = df_hist
             else: 
                 if sym not in df_hist: continue
@@ -147,29 +138,37 @@ def analyze_stocks_pro(symbols):
             
             if sdf.empty or len(sdf) < 50: continue
             
-            # 指標計算
             sma50 = ta.trend.SMAIndicator(sdf['Close'], window=50).sma_indicator().iloc[-1]
             rsi = ta.momentum.RSIIndicator(sdf['Close'], window=14).rsi().iloc[-1]
-            
-            # トレンド判定（現在価格 vs SMA50）
             trend_up = current_price > sma50
             
-            # --- C. 判定ロジック ---
-            verdict, score = "", 0
+            # --- C. 判定ロジック (明確化) ---
+            verdict, score, reason_short = "", 0, ""
+            
             if trend_up:
-                if rsi < 35: verdict, score = "💎 超・買い時", 100
-                elif rsi < 50: verdict, score = "◎ 押し目買い", 80
-                elif rsi > 75: verdict, score = "⚡ 利確検討", -10
-                else: verdict, score = "○ 保有/継続", 50
+                # RSIの数値で明確に区切る
+                if rsi < 35:
+                    verdict, score = "💎 超・買い時", 100
+                    reason_short = "RSI<35: 絶好の拾い場"
+                elif rsi < 50:
+                    verdict, score = "◎ 押し目買い", 80
+                    reason_short = "RSI<50: 買いチャンス"
+                elif rsi < 55:
+                    verdict, score = "○ 保有/監視", 60
+                    reason_short = "あと少しで買い (RSI 50台)" # ★親切機能
+                elif rsi > 75:
+                    verdict, score = "⚡ 利確検討", -10
+                    reason_short = "RSI>75: 加熱しすぎ"
+                else:
+                    verdict, score = "○ 保有/継続", 50
+                    reason_short = "順調に推移中"
             else:
-                if rsi < 30: verdict, score = "△ リバウンド狙い", 40
-                else: verdict, score = "× 様子見", 0
-
-            # 理由コード
-            if rsi < 35: reason_short = "売られすぎ"
-            elif rsi > 70: reason_short = "買われすぎ"
-            elif trend_up: reason_short = "トレンド順行"
-            else: reason_short = "トレンド逆行"
+                if rsi < 30:
+                    verdict, score = "△ リバウンド狙い", 40
+                    reason_short = "下降中だが売られすぎ"
+                else:
+                    verdict, score = "× 様子見", 0
+                    reason_short = "下降トレンド中"
 
             results.append({
                 "Symbol": sym,
@@ -179,7 +178,7 @@ def analyze_stocks_pro(symbols):
                 "Trend": "📈 上昇" if trend_up else "📉 下降",
                 "Verdict": verdict,
                 "Score": score,
-                "Reason": reason_short
+                "Reason": reason_short # 理由を短く表示
             })
         except: continue
     
@@ -191,7 +190,6 @@ def analyze_stocks_pro(symbols):
 # --- スタイリング ---
 def color_change_text(val):
     if pd.isna(val): return 'color: white'
-    # 前日比が0以上の場合は緑、マイナスは赤
     color = '#00FF00' if val >= 0 else '#FF0000'
     return f'color: {color}'
 
@@ -225,8 +223,9 @@ def main():
                 df_anl = analyze_stocks_pro(curr_list)
 
             if not df_anl.empty:
-                display_df = df_anl[["Verdict", "Symbol", "Price", "Change", "RSI", "Trend"]].copy()
-                display_df.columns = ["Verdict", "Symbol", "Price", "Change", "RSI (過熱感)", "Trend"]
+                # ユーザーに見せるカラムを整理
+                display_df = df_anl[["Verdict", "Symbol", "Price", "Change", "RSI", "Reason"]].copy()
+                display_df.columns = ["Verdict", "Symbol", "Price", "Change", "RSI (過熱感)", "状況コメント"]
                 
                 st.dataframe(
                     display_df.style.format({
@@ -240,24 +239,32 @@ def main():
                         "Price": st.column_config.NumberColumn("現在値", format="$%.2f"),
                         "Change": st.column_config.NumberColumn("前日比", format="%.2f%%"),
                         "RSI (過熱感)": st.column_config.ProgressColumn(
-                            "RSI (過熱感)",
-                            help="売られすぎ(0) <---> 買われすぎ(100)",
+                            "RSI (50以下で買い)", # ★ヘッダーで答えを言ってしまう
+                            help="【買い基準】50以下: 押し目買い / 35以下: 超・買い時",
                             format="%d",
                             min_value=0,
                             max_value=100,
                         ),
-                        "Trend": st.column_config.TextColumn("トレンド", width="small"),
+                        "状況コメント": st.column_config.TextColumn("状況コメント", width="medium"),
                     },
                     hide_index=True,
                     use_container_width=True,
                     height=600
                 )
                 
-                with st.expander("💡 なぜこの判断なのか？ (AIロジックの解説)"):
+                # ★ここを明確に修正：基準値をハッキリ書く
+                with st.expander("💡 判定基準（カンニングペーパー）", expanded=True):
                     st.markdown("""
-                    **判定ロジック:**
-                    1. **トレンド判定 (SMA50):** 過去50日の平均より株価が上なら「上昇トレンド」。
-                    2. **タイミング判定 (RSI):** 上昇中に一時的に売られた（RSIが低い）瞬間を狙います。
+                    **このAIは「上昇トレンドの押し目（一時的な下落）」を狙っています。**
+                    
+                    | 判定シグナル | RSIの基準値 | 意味 |
+                    | :--- | :--- | :--- |
+                    | 💎 **超・買い時** | **35 以下** | バーゲンセール状態。迷わずエントリー。 |
+                    | ◎ **押し目買い** | **50 以下** | 加熱感が冷めた状態。ここから買い。 |
+                    | ○ **保有/監視** | **50〜75** | 順調。慌てて買う必要なし（下がるのを待つ）。 |
+                    | ⚡ **利確検討** | **75 以上** | 買われすぎ。急落に注意。 |
+                    
+                    ※ **前提条件:** 株価が50日移動平均線より上にあること（＝上昇トレンド）。
                     """)
                 
             else:
