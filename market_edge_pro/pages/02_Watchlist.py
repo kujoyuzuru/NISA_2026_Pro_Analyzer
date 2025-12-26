@@ -50,7 +50,16 @@ def load_watchlist():
     finally: conn.close()
 
 def save_watchlist(name, symbols_list):
-    clean_list = sorted(list(set([s.strip().upper() for s in symbols_list if s.strip()])))
+    # ★修正点: 勝手に sorted() せず、ユーザーの指定順を維持する
+    # 空白削除と大文字化のみ行う
+    clean_list = []
+    seen = set()
+    for s in symbols_list:
+        clean_s = s.strip().upper()
+        if clean_s and clean_s not in seen:
+            clean_list.append(clean_s)
+            seen.add(clean_s)
+    
     clean_str = ",".join(clean_list)
     conn = get_connection()
     try:
@@ -84,8 +93,6 @@ def analyze_stocks_pro(symbols):
             # --- 指標計算 ---
             close = float(sdf['Close'].iloc[-1])
             prev_close = float(sdf['Close'].iloc[-2])
-            
-            # ★修正箇所: ここでパーセント計算しているので、後で割らない
             change_pct = (close - prev_close) / prev_close * 100
             
             sma50 = ta.trend.SMAIndicator(sdf['Close'], window=50).sma_indicator().iloc[-1]
@@ -130,7 +137,7 @@ def analyze_stocks_pro(symbols):
                 "Symbol": sym,
                 "Name": meta["name"],
                 "Price": close,
-                "Change": change_pct, # ★修正: /100 を削除しました
+                "Change": change_pct,
                 "RSI": rsi,
                 "Trend": "📈 上昇" if trend_up else "📉 下降",
                 "Verdict": verdict,
@@ -140,6 +147,8 @@ def analyze_stocks_pro(symbols):
         except: continue
     
     df_res = pd.DataFrame(results)
+    # 並び順: スコア順にしたい場合はここを残す。
+    # リスト順にしたい場合は、以下の2行をコメントアウトしてください。
     if not df_res.empty:
         df_res = df_res.sort_values(by="Score", ascending=False)
     
@@ -164,6 +173,8 @@ def main():
                 return f"{t} | {m['name']}" if m else t
 
             merged_opts = sorted(list(set(ALL_OPTIONS + curr_list)))
+            
+            # ★ポイント: defaultに渡した順番がそのまま表示されます
             sel = st.multiselect("銘柄を追加/削除", merged_opts, default=curr_list, format_func=fmt)
             
             manual = st.text_input("手動追加 (例: GME)", placeholder="コードを入力")
@@ -198,7 +209,7 @@ def main():
                         "Verdict": st.column_config.TextColumn("🤖 AI判定", width="medium"),
                         "Symbol": st.column_config.TextColumn("銘柄", width="small"),
                         "Price": st.column_config.NumberColumn("株価", format="$%.2f"),
-                        "Change": st.column_config.NumberColumn("前日比", format="%.2f%%"), # これで正しく % が付きます
+                        "Change": st.column_config.NumberColumn("前日比", format="%.2f%%"),
                         "RSI": st.column_config.ProgressColumn(
                             "過熱感 (RSI)", 
                             format="%d", 
@@ -212,14 +223,6 @@ def main():
                     use_container_width=True,
                     height=500
                 )
-                
-                st.markdown("""
-                ##### 💡 判定の見方
-                - **💎 超・買い時**: 上昇トレンド中に一時的に暴落した状態。最高のエントリー・ポイント。
-                - **◎ 押し目買い**: トレンドは上向きで、過熱感もない状態。素直に買って良い。
-                - **⚡ 利確検討**: 上がりすぎてRSIが75を超えている。そろそろ落ちる可能性大。
-                - **× 様子見**: 下降トレンド中。触ると火傷する。
-                """)
             else:
                 st.error("データ取得に失敗しました。")
 
