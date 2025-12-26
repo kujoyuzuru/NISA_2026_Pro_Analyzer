@@ -9,27 +9,23 @@ import time
 import sys
 
 # ---------------------------------------------------------
-# セットアップ & パス解決（ここを強化）
+# セットアップ & パス解決
 # ---------------------------------------------------------
 st.set_page_config(page_title="Scanner", layout="wide")
 
-# 現在のファイル（pages/01_Scanner.py）の場所を基準に、親フォルダ（ルート）を特定
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-# 親フォルダを読み込み対象に追加（これで import core が確実に動く）
 if BASE_DIR not in sys.path:
     sys.path.append(BASE_DIR)
 
-# パスの定義（絶対パスで指定）
+# パスの定義
 LOGIC_PATH = os.path.join(BASE_DIR, "core", "logic.py")
 RULES_PATH = os.path.join(BASE_DIR, "config", "default_rules.json")
+DB_PATH = os.path.join(BASE_DIR, "trading_journal.db")
 
-# ファイル存在チェック（デバッグ情報付き）
+# ファイル存在チェック
 if not os.path.exists(LOGIC_PATH):
     st.error(f"⚠️ ファイルが見つかりません: {LOGIC_PATH}")
-    st.info(f"現在の場所: {os.getcwd()}")
-    st.info(f"ファイル一覧: {os.listdir(BASE_DIR)}")
     st.stop()
-
 if not os.path.exists(RULES_PATH):
     st.error(f"⚠️ ファイルが見つかりません: {RULES_PATH}")
     st.stop()
@@ -37,29 +33,80 @@ if not os.path.exists(RULES_PATH):
 # ロジックエンジンの読み込み
 try:
     from core.logic import RuleEngine
-except ImportError as e:
-    st.error(f"⚠️ モジュールの読み込みに失敗しました: {e}")
+except ImportError:
+    st.error("ロジックエンジンの読み込みに失敗しました。")
     st.stop()
+
+# ---------------------------------------------------------
+# ★緊急修理機能：データベース初期化★
+# ---------------------------------------------------------
+def force_init_db():
+    """テーブルがない場合に無理やり作成する関数"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    # 1. 監視リストテーブル作成
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS watchlists (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            symbols TEXT NOT NULL
+        )
+    ''')
+    
+    # 2. データが空なら初期データを入れる
+    c.execute("SELECT count(*) FROM watchlists")
+    if c.fetchone()[0] == 0:
+        c.execute("INSERT INTO watchlists (name, symbols) VALUES (?, ?)", 
+                  ("Default Watchlist", "AAPL,MSFT,TSLA,NVDA,GOOGL,AMZN,META,AMD"))
+
+    # その他のテーブルも念のため作成
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS rule_sets (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            json_body TEXT NOT NULL
+        )
+    ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS scan_results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scanned_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            rule_set_id TEXT,
+            symbol TEXT,
+            is_match BOOLEAN,
+            match_details JSON,
+            market_data_snapshot JSON
+        )
+    ''')
+    conn.commit()
+    conn.close()
 
 # ---------------------------------------------------------
 # ヘルパー関数
 # ---------------------------------------------------------
 def get_db_connection():
-    # DBファイルも絶対パスで指定して迷子を防ぐ
-    db_path = os.path.join(BASE_DIR, "trading_journal.db")
-    return sqlite3.connect(db_path)
+    # 接続時にテーブルチェックを行う（なければ直す）
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        conn.execute("SELECT * FROM watchlists LIMIT 1")
+    except sqlite3.OperationalError:
+        conn.close()
+        # エラーが出たら修理実行
+        force_init_db()
+        # 再接続
+        conn = sqlite3.connect(DB_PATH)
+    return conn
 
 @st.cache_data(ttl=3600)
 def fetch_market_data(symbols):
     data_map = {}
     tickers = " ".join(symbols)
-    if not tickers:
-        return {}
+    if not tickers: return {}
 
     try:
         df = yf.download(tickers, period="6mo", interval="1d", group_by='ticker', auto_adjust=True, progress=False)
-    except Exception as e:
-        st.error(f"データ取得エラー: {e}")
+    except Exception:
         return {}
 
     for symbol in symbols:
@@ -93,13 +140,16 @@ def fetch_market_data(symbols):
 def main():
     st.title("📡 Market Scanner")
     
-    # DBから監視リスト取得
+    # DB接続 & 監視リスト取得
     try:
-        conn = get_db_connection()
+        conn = get_db_connection() # ここで自動修復が走る
         watchlist_df = pd.read_sql("SELECT * FROM watchlists LIMIT 1", conn)
         conn.close()
     except Exception as e:
-        st.error(f"DBエラー: {e}")
+        st.error(f"データベースエラー: {e}")
+        if st.button("データベースを強制リセットする"):
+            force_init_db()
+            st.rerun()
         return
 
     if watchlist_df.empty:
@@ -109,7 +159,7 @@ def main():
     target_symbols = watchlist_df.iloc[0]['symbols'].split(',')
     target_list_name = watchlist_df.iloc[0]['name']
 
-    # ルール読み込み（絶対パスを使用）
+    # ルール読み込み
     with open(RULES_PATH, "r", encoding='utf-8') as f:
         rule_set = json.load(f)
 
@@ -140,8 +190,7 @@ def main():
         for i, symbol in enumerate(target_symbols):
             progress_bar.progress((i + 1) / len(target_symbols))
             
-            if symbol not in market_data_map:
-                continue
+            if symbol not in market_data_map: continue
 
             data = market_data_map[symbol]
             is_match, details = engine.evaluate(rule_set, data)
