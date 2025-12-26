@@ -104,66 +104,57 @@ def save_watchlist(name, symbols_list):
     except: return []
     finally: conn.close()
 
-# --- 分析ロジック (ハイブリッド版) ---
-# 日足(長期)と15分足(短期)を組み合わせて、データの遅延を防ぐ
+# --- 分析ロジック (Fast Info実装版) ---
 @st.cache_data(ttl=15)
 def analyze_stocks_pro(symbols):
     if not symbols: return pd.DataFrame()
-    tickers_str = " ".join(symbols)
     
+    # 1. テクニカル指標用のデータ取得（これはまとめて取るのが速い）
+    # ※ここは「分析（RSI/SMA）」のためだけに使う
+    tickers_str = " ".join(symbols)
     try:
-        # 1. テクニカル分析用：日足データ (過去6ヶ月)
-        # ※指標(SMA/RSI)は日足ベースで計算するのが正しいため
-        df_daily = yf.download(tickers_str, period="6mo", interval="1d", group_by='ticker', auto_adjust=True, progress=False)
-        
-        # 2. リアルタイム価格用：15分足データ (過去5日)
-        # ※「1d」だと休日の影響でデータが遅れることがあるため、「15m」で最新の値動きを強制的に取りに行く
-        df_live = yf.download(tickers_str, period="5d", interval="15m", group_by='ticker', auto_adjust=True, progress=False)
-        
+        df_hist = yf.download(tickers_str, period="6mo", interval="1d", group_by='ticker', auto_adjust=True, progress=False)
     except: return pd.DataFrame()
+
+    # 2. 正確な現在価格を取得するためのTickerオブジェクト群
+    # ※ここがポイント：downloadではなくTickersオブジェクトを使う
+    tickers_obj = yf.Tickers(tickers_str)
 
     results = []
     for sym in symbols:
         try:
-            # --- データの準備 ---
-            if len(symbols) == 1:
-                daily_s = df_daily
-                live_s = df_live
-            else:
-                if sym not in df_daily or sym not in df_live: continue
-                daily_s = df_daily[sym]
-                live_s = df_live[sym]
-            
-            # データ不足チェック
-            if daily_s.empty or len(daily_s) < 50: continue
-            if live_s.empty: continue
+            # --- A. 正確な価格データの取得 (Fast Info) ---
+            # チャートから計算するのではなく、取引所のメタデータを直接読む
+            try:
+                info = tickers_obj.tickers[sym].fast_info
+                current_price = info.last_price
+                prev_close = info.previous_close
+                
+                if current_price is None or prev_close is None:
+                    continue # データが取れない場合はスキップ
+                
+                # これが「証券会社と同じ」計算式
+                change_val = current_price - prev_close
+                change_pct = (change_val / prev_close) * 100
+            except:
+                continue
 
-            # --- 値の取得 ---
-            # ★ここが修正点: 現在価格は「15分足の最新」を使う（これが一番早い）
-            current_price = float(live_s['Close'].iloc[-1])
+            # --- B. テクニカル指標の計算 (History) ---
+            if len(symbols) == 1: sdf = df_hist
+            else: 
+                if sym not in df_hist: continue
+                sdf = df_hist[sym]
             
-            # 比較対象（前日終値）は「日足の最後の確定値」を使う
-            # ※日足の最終行が「今日の作りかけ」か「昨日」かで計算が変わるが、
-            # 簡易的に「日足の最後」と比較することで、常に前回の確定値との差分を見る
-            prev_close_daily = float(daily_s['Close'].iloc[-1])
+            if sdf.empty or len(sdf) < 50: continue
             
-            # もし「日足の最後」と「現在値」がほぼ同じ(データ更新なし)なら、もう一つ前と比較する
-            # (Yahoo Financeの日足がまだ更新されていない場合への対策)
-            if abs(current_price - prev_close_daily) < 0.001: 
-                 prev_close = float(daily_s['Close'].iloc[-2])
-            else:
-                 prev_close = prev_close_daily
-
-            # 前日比計算
-            change_val = current_price - prev_close
-            change_pct = (change_val / prev_close) * 100
+            # 指標計算
+            sma50 = ta.trend.SMAIndicator(sdf['Close'], window=50).sma_indicator().iloc[-1]
+            rsi = ta.momentum.RSIIndicator(sdf['Close'], window=14).rsi().iloc[-1]
             
-            # --- テクニカル指標 (日足ベース) ---
-            sma50 = ta.trend.SMAIndicator(daily_s['Close'], window=50).sma_indicator().iloc[-1]
-            rsi = ta.momentum.RSIIndicator(daily_s['Close'], window=14).rsi().iloc[-1]
-            trend_up = current_price > sma50 # トレンド判定も最新価格で行う
+            # トレンド判定（現在価格 vs SMA50）
+            trend_up = current_price > sma50
             
-            # --- 判定ロジック ---
+            # --- C. 判定ロジック ---
             verdict, score = "", 0
             if trend_up:
                 if rsi < 35: verdict, score = "💎 超・買い時", 100
@@ -174,6 +165,12 @@ def analyze_stocks_pro(symbols):
                 if rsi < 30: verdict, score = "△ リバウンド狙い", 40
                 else: verdict, score = "× 様子見", 0
 
+            # 理由コード
+            if rsi < 35: reason_short = "売られすぎ"
+            elif rsi > 70: reason_short = "買われすぎ"
+            elif trend_up: reason_short = "トレンド順行"
+            else: reason_short = "トレンド逆行"
+
             results.append({
                 "Symbol": sym,
                 "Price": current_price,
@@ -181,7 +178,8 @@ def analyze_stocks_pro(symbols):
                 "RSI": rsi,
                 "Trend": "📈 上昇" if trend_up else "📉 下降",
                 "Verdict": verdict,
-                "Score": score
+                "Score": score,
+                "Reason": reason_short
             })
         except: continue
     
@@ -193,6 +191,7 @@ def analyze_stocks_pro(symbols):
 # --- スタイリング ---
 def color_change_text(val):
     if pd.isna(val): return 'color: white'
+    # 前日比が0以上の場合は緑、マイナスは赤
     color = '#00FF00' if val >= 0 else '#FF0000'
     return f'color: {color}'
 
