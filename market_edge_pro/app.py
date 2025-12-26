@@ -32,34 +32,31 @@ def ensure_db():
 def run_init(m):
     with st.spinner(m): init_db(); time.sleep(1); st.rerun()
 
-# --- ★修正: S&P500 ETF (SPY) を取得 ---
-# 指数(^GSPC)は遅延がひどいため、リアルタイム性の高いETF(SPY)をトップに置く
-@st.cache_data(ttl=30) # 30秒更新
+# --- ★修正: 最軽量・高速なデータ取得 (Fast Info) ---
+# history()を使わず、fast_infoを使うことでエラーと待ち時間をなくす
+@st.cache_data(ttl=30)
 def get_market_status():
-    target = "SPY" 
+    target = "SPY"
     
     try:
         ticker = yf.Ticker(target)
         
-        # 15分足の最新データを取得（これで現在値はリアルタイムに近づく）
-        hist = ticker.history(period="5d", interval="15m")
+        # fast_infoは通信量が少なく、一瞬で「現在値」と「前日終値」だけを取れる
+        # これならタイムアウトやデータ欠損がほぼ起きない
+        current_price = ticker.fast_info.last_price
+        prev_close = ticker.fast_info.previous_close
         
-        if not hist.empty:
-            current_price = float(hist['Close'].iloc[-1])
-            
-            # 前日比の計算（日足の終値と比較）
-            # ※市場が開いている間は、yfinanceのinfoよりhistory計算の方が確実
-            prev_close = float(ticker.info.get('previousClose', hist['Close'].iloc[-2]))
-            
+        if current_price and prev_close:
             delta = current_price - prev_close
             delta_percent = (delta / prev_close) * 100
             
             return "S&P 500 ETF (SPY)", f"${current_price:,.2f}", f"{delta:+.2f} ({delta_percent:+.2f}%)"
             
     except:
+        # 万が一失敗した場合は、エラーではなく「---」を表示してアプリを止めない
         pass
             
-    return "S&P 500", "Data Loading...", "0.00%"
+    return "S&P 500 (SPY)", "$---", "0.00%"
 
 def main():
     if "tos_agreed" not in st.session_state: st.session_state.tos_agreed = False
@@ -80,7 +77,7 @@ def main():
         </h1>
     """, unsafe_allow_html=True)
 
-    # 市場データの取得
+    # 高速データ取得
     idx_name, sp500_price, sp500_delta = get_market_status()
 
     st.markdown("---")
@@ -89,9 +86,9 @@ def main():
     
     with c1:
         st.subheader("📊 市場ステータス")
-        # SPYを表示することで、MSNなどと「色（上げ下げ）」が一致しやすくなる
         st.metric(idx_name, sp500_price, sp500_delta)
-        st.caption("Target: SPY (S&P 500 ETF)")
+        # ちゃんとSPYであることを明記
+        st.caption("Target: SPY (S&P 500 ETF) | Real-time Quote")
     
     with c2:
         st.subheader("👁 監視リスト")
