@@ -19,7 +19,7 @@ BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if BASE_DIR not in sys.path: sys.path.append(BASE_DIR)
 DB_PATH = os.path.join(BASE_DIR, "trading_journal.db")
 
-# --- 銘柄マスターデータ ---
+# --- 銘柄マスターデータ (省略なし) ---
 STOCK_MASTER = {
     "SPY": {"name": "SPDR S&P 500", "sector": "INDEX: S&P500"},
     "QQQ": {"name": "Invesco QQQ", "sector": "INDEX: NASDAQ100"},
@@ -104,34 +104,66 @@ def save_watchlist(name, symbols_list):
     except: return []
     finally: conn.close()
 
-# --- 分析ロジック ---
+# --- 分析ロジック (ハイブリッド版) ---
+# 日足(長期)と15分足(短期)を組み合わせて、データの遅延を防ぐ
 @st.cache_data(ttl=15)
 def analyze_stocks_pro(symbols):
     if not symbols: return pd.DataFrame()
     tickers_str = " ".join(symbols)
+    
     try:
-        df_hist = yf.download(tickers_str, period="6mo", interval="1d", group_by='ticker', auto_adjust=True, progress=False)
+        # 1. テクニカル分析用：日足データ (過去6ヶ月)
+        # ※指標(SMA/RSI)は日足ベースで計算するのが正しいため
+        df_daily = yf.download(tickers_str, period="6mo", interval="1d", group_by='ticker', auto_adjust=True, progress=False)
+        
+        # 2. リアルタイム価格用：15分足データ (過去5日)
+        # ※「1d」だと休日の影響でデータが遅れることがあるため、「15m」で最新の値動きを強制的に取りに行く
+        df_live = yf.download(tickers_str, period="5d", interval="15m", group_by='ticker', auto_adjust=True, progress=False)
+        
     except: return pd.DataFrame()
 
     results = []
     for sym in symbols:
         try:
-            if len(symbols) == 1: sdf = df_hist
-            else: 
-                if sym not in df_hist: continue
-                sdf = df_hist[sym]
+            # --- データの準備 ---
+            if len(symbols) == 1:
+                daily_s = df_daily
+                live_s = df_live
+            else:
+                if sym not in df_daily or sym not in df_live: continue
+                daily_s = df_daily[sym]
+                live_s = df_live[sym]
             
-            if sdf.empty or len(sdf) < 50: continue
+            # データ不足チェック
+            if daily_s.empty or len(daily_s) < 50: continue
+            if live_s.empty: continue
 
-            current_close = float(sdf['Close'].iloc[-1])
-            prev_close = float(sdf['Close'].iloc[-2])
-            change_val = current_close - prev_close
+            # --- 値の取得 ---
+            # ★ここが修正点: 現在価格は「15分足の最新」を使う（これが一番早い）
+            current_price = float(live_s['Close'].iloc[-1])
+            
+            # 比較対象（前日終値）は「日足の最後の確定値」を使う
+            # ※日足の最終行が「今日の作りかけ」か「昨日」かで計算が変わるが、
+            # 簡易的に「日足の最後」と比較することで、常に前回の確定値との差分を見る
+            prev_close_daily = float(daily_s['Close'].iloc[-1])
+            
+            # もし「日足の最後」と「現在値」がほぼ同じ(データ更新なし)なら、もう一つ前と比較する
+            # (Yahoo Financeの日足がまだ更新されていない場合への対策)
+            if abs(current_price - prev_close_daily) < 0.001: 
+                 prev_close = float(daily_s['Close'].iloc[-2])
+            else:
+                 prev_close = prev_close_daily
+
+            # 前日比計算
+            change_val = current_price - prev_close
             change_pct = (change_val / prev_close) * 100
             
-            sma50 = ta.trend.SMAIndicator(sdf['Close'], window=50).sma_indicator().iloc[-1]
-            rsi = ta.momentum.RSIIndicator(sdf['Close'], window=14).rsi().iloc[-1]
-            trend_up = current_close > sma50
+            # --- テクニカル指標 (日足ベース) ---
+            sma50 = ta.trend.SMAIndicator(daily_s['Close'], window=50).sma_indicator().iloc[-1]
+            rsi = ta.momentum.RSIIndicator(daily_s['Close'], window=14).rsi().iloc[-1]
+            trend_up = current_price > sma50 # トレンド判定も最新価格で行う
             
+            # --- 判定ロジック ---
             verdict, score = "", 0
             if trend_up:
                 if rsi < 35: verdict, score = "💎 超・買い時", 100
@@ -142,22 +174,14 @@ def analyze_stocks_pro(symbols):
                 if rsi < 30: verdict, score = "△ リバウンド狙い", 40
                 else: verdict, score = "× 様子見", 0
 
-            # 理由を明確化
-            reason_short = ""
-            if rsi < 35: reason_short = "売られすぎ"
-            elif rsi > 70: reason_short = "買われすぎ"
-            elif trend_up: reason_short = "トレンド順行"
-            else: reason_short = "トレンド逆行"
-
             results.append({
                 "Symbol": sym,
-                "Price": current_close,
+                "Price": current_price,
                 "Change": change_pct,
                 "RSI": rsi,
                 "Trend": "📈 上昇" if trend_up else "📉 下降",
                 "Verdict": verdict,
-                "Score": score,
-                "Reason": reason_short
+                "Score": score
             })
         except: continue
     
@@ -202,12 +226,9 @@ def main():
                 df_anl = analyze_stocks_pro(curr_list)
 
             if not df_anl.empty:
-                # 1. 表示用データフレームの作成
                 display_df = df_anl[["Verdict", "Symbol", "Price", "Change", "RSI", "Trend"]].copy()
                 display_df.columns = ["Verdict", "Symbol", "Price", "Change", "RSI (過熱感)", "Trend"]
                 
-                # 2. StreamlitのColumnConfigを使ってビジュアル化
-                # ここが「信頼」を作るカギです：理論を視覚化する
                 st.dataframe(
                     display_df.style.format({
                         "Price": "${:,.2f}",
@@ -219,16 +240,13 @@ def main():
                         "Symbol": st.column_config.TextColumn("銘柄", width="small"),
                         "Price": st.column_config.NumberColumn("現在値", format="$%.2f"),
                         "Change": st.column_config.NumberColumn("前日比", format="%.2f%%"),
-                        
-                        # ★ここが追加ポイント: RSIをバーで見せる
                         "RSI (過熱感)": st.column_config.ProgressColumn(
                             "RSI (過熱感)",
-                            help="売られすぎ(0) <---> 買われすぎ(100)。30以下は買いシグナル、70以上は売り警戒。",
+                            help="売られすぎ(0) <---> 買われすぎ(100)",
                             format="%d",
                             min_value=0,
                             max_value=100,
                         ),
-                        # トレンドをわかりやすく
                         "Trend": st.column_config.TextColumn("トレンド", width="small"),
                     },
                     hide_index=True,
@@ -236,23 +254,11 @@ def main():
                     height=600
                 )
                 
-                # 3. 理論の解説セクション（ブラックボックスを開示する）
                 with st.expander("💡 なぜこの判断なのか？ (AIロジックの解説)"):
                     st.markdown("""
-                    このアプリは、プロの投資家が使う**2つの「王道理論」**を組み合わせて自動判定しています。
-                    
-                    #### 1. トレンド判定：グランビルの法則 (SMA50)
-                    * **仕組み:** 過去50日の平均価格（SMA50）より、現在の株価が「上」にあれば**「上昇トレンド」**とみなします。
-                    * **意味:** 「株価は波を描きながらトレンド方向に進む」という理論に基づき、上昇中の株のみをターゲットにします。
-                    
-                    #### 2. タイミング判定：RSI (相対力指数)
-                    * **仕組み:** 「買われすぎ」「売られすぎ」を0〜100の数値で測ります。
-                    * **意味:** 上昇トレンド中にRSIが低くなった瞬間（押し目）は、**「一時的に安くなっているだけ」**なので、絶好の買い場となります。
-                    
-                    **判定の根拠:**
-                    * 💎 **超・買い時:** 上昇トレンド中 ＋ RSI < 35 (暴落レベルの安値)
-                    * ◎ **押し目買い:** 上昇トレンド中 ＋ RSI < 50 (過熱感なし)
-                    * ⚡ **利確検討:** RSI > 75 (加熱しすぎ。反落警戒)
+                    **判定ロジック:**
+                    1. **トレンド判定 (SMA50):** 過去50日の平均より株価が上なら「上昇トレンド」。
+                    2. **タイミング判定 (RSI):** 上昇中に一時的に売られた（RSIが低い）瞬間を狙います。
                     """)
                 
             else:
