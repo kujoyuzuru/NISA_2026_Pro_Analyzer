@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import yfinance as yf
-import requests  # ★ライブラリの代わりにこれを使う
+import requests  # 標準ライブラリで直接通信
 import json
 import os
 import sqlite3
@@ -21,75 +21,84 @@ RULES_PATH = os.path.join(BASE_DIR, "config", "default_rules.json")
 DB_PATH = os.path.join(BASE_DIR, "trading_journal.db")
 
 if not os.path.exists(LOGIC_PATH) or not os.path.exists(RULES_PATH):
-    st.error("System Error: Configuration files missing."); st.stop()
+    st.error("System Error: Config files missing."); st.stop()
 try: from core.logic import RuleEngine
-except ImportError: st.error("System Error: Engine load failed."); st.stop()
+except ImportError: st.error("System Error: Logic engine failed."); st.stop()
 
-# --- プロ仕様: データ取得クラス (Lightweight) ---
+# --- ★復活：DB自動修復機能 (Safety Net) ---
+def force_init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS watchlists (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, symbols TEXT)''')
+    # データがなければ初期値を投入
+    c.execute("SELECT count(*) FROM watchlists")
+    if c.fetchone()[0] == 0:
+        c.execute("INSERT INTO watchlists (name, symbols) VALUES (?, ?)", 
+                  ("Default Watchlist", "AAPL,MSFT,TSLA,NVDA,GOOGL,AMZN,META,AMD"))
+    conn.commit()
+    conn.close()
+
+def get_db_connection():
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        # テーブルがあるかテスト
+        conn.execute("SELECT * FROM watchlists LIMIT 1")
+    except sqlite3.OperationalError:
+        conn.close()
+        # なければ修復実行
+        force_init_db()
+        conn = sqlite3.connect(DB_PATH)
+    return conn
+
+# --- プロ仕様: データ取得 (Lightweight/No-Lib) ---
 class DataProvider:
     def __init__(self):
-        # APIキー取得
         self.api_key = os.getenv("ALPACA_API_KEY") or st.secrets.get("ALPACA_API_KEY")
         self.api_secret = os.getenv("ALPACA_SECRET_KEY") or st.secrets.get("ALPACA_SECRET_KEY")
         self.use_alpaca = bool(self.api_key and self.api_secret)
-        self.source_name = "Alpaca (Official Data)" if self.use_alpaca else "Yahoo Finance (Backup)"
+        self.source_name = "Alpaca (Official)" if self.use_alpaca else "Yahoo Finance (Backup)"
 
     def fetch(self, symbols):
-        """ハイブリッドデータ取得"""
         if self.use_alpaca:
             try:
                 return self._fetch_alpaca_direct(symbols)
             except Exception as e:
-                st.warning(f"Alpaca Connection Failed: {e}. Switching to Backup.")
+                st.warning(f"Alpaca Error: {e}. Switching to Backup.")
                 self.source_name = "Yahoo Finance (Backup)"
                 return self._fetch_yahoo(symbols)
         else:
             return self._fetch_yahoo(symbols)
 
     def _fetch_alpaca_direct(self, symbols):
-        """ライブラリを使わず直接APIを叩く（高速・エラーなし）"""
-        data_map = {}
-        # Alpaca Data API v2 Endpoint
+        # ライブラリを使わずrequestsで直接叩く（エラー回避）
         url = "https://data.alpaca.markets/v2/stocks/bars"
-        
         headers = {
             "APCA-API-KEY-ID": self.api_key,
             "APCA-API-SECRET-KEY": self.api_secret,
             "accept": "application/json"
         }
-        
-        # 過去データの期間設定
-        end_dt = datetime.now()
-        start_dt = end_dt - timedelta(days=300)
-        
-        # パラメータ設定
         params = {
             "symbols": ",".join(symbols),
             "timeframe": "1Day",
-            "start": start_dt.strftime("%Y-%m-%d"),
-            "end": end_dt.strftime("%Y-%m-%d"),
-            "limit": 1000,
-            "adjustment": "raw",
-            "feed": "iex"  # 無料プラン用データフィード
+            "limit": 300,
+            "feed": "iex"
         }
+        # エラーハンドリング強化
+        try:
+            response = requests.get(url, headers=headers, params=params, timeout=5)
+            response.raise_for_status()
+        except requests.exceptions.RequestException as e:
+            raise Exception(f"Connection failed: {e}")
 
-        response = requests.get(url, headers=headers, params=params, timeout=10)
-        
-        if response.status_code != 200:
-            raise Exception(f"API Error {response.status_code}: {response.text}")
-
-        json_data = response.json()
-        bars_data = json_data.get("bars", {})
+        data_map = {}
+        bars_data = response.json().get("bars", {})
 
         for sym, bars in bars_data.items():
             if not bars or len(bars) < 50: continue
-            
-            # DataFrameに変換
             df = pd.DataFrame(bars)
-            # カラム名を統一 (Alpaca: c->Close, v->Volume)
             df = df.rename(columns={"c": "Close", "v": "Volume"})
             
-            # 指標計算
             close = float(df['Close'].iloc[-1])
             sma50 = ta.trend.SMAIndicator(df['Close'], window=50).sma_indicator().iloc[-1]
             rsi14 = ta.momentum.RSIIndicator(df['Close'], window=14).rsi().iloc[-1]
@@ -100,7 +109,6 @@ class DataProvider:
                 "sma": sma50, "rsi": rsi14, "volume": vol,
                 "timestamp": datetime.now().strftime("%H:%M:%S")
             }
-        
         return data_map
 
     def _fetch_yahoo(self, symbols):
@@ -115,12 +123,10 @@ class DataProvider:
             try:
                 sdf = df if len(symbols)==1 else df[sym]
                 if sdf.empty or len(sdf)<50: continue
-                
                 close = float(sdf['Close'].iloc[-1])
                 sma50 = ta.trend.SMAIndicator(sdf['Close'], window=50).sma_indicator().iloc[-1]
                 rsi14 = ta.momentum.RSIIndicator(sdf['Close'], window=14).rsi().iloc[-1]
                 vol = float(sdf['Volume'].iloc[-1])
-                
                 data_map[sym] = {
                     "symbol": sym, "price": close, "close": close,
                     "sma": sma50, "rsi": rsi14, "volume": vol,
@@ -137,14 +143,20 @@ def main():
 
     st.title("📡 市場スキャナー")
 
-    # DB接続
-    conn = sqlite3.connect(DB_PATH)
+    # DB接続（修復機能付き）
     try:
+        conn = get_db_connection()
         w_df = pd.read_sql("SELECT * FROM watchlists LIMIT 1", conn)
         conn.close()
         if w_df.empty: st.warning("監視リストが空です"); return
         targets = w_df.iloc[0]['symbols'].split(',')
-    except: st.error("System Error: DB Connection Failed"); return
+    except Exception as e:
+        # 具体的なエラーを表示してデバッグしやすくする
+        st.error(f"Critical DB Error: {e}")
+        if st.button("データベースを強制リセット"):
+            force_init_db()
+            st.rerun()
+        return
 
     # ルール読み込み
     with open(RULES_PATH, "r", encoding='utf-8') as f:
@@ -177,7 +189,7 @@ def main():
             m_data = provider.fetch(targets)
         
         if not m_data:
-            st.error("データ取得に失敗しました。市場が閉じているか、接続エラーです。")
+            st.error("データ取得失敗。市場が閉じているか、Yahoo/Alpaca両方が応答しません。")
             return
 
         st.caption(f"ℹ️ Data Source: {provider.source_name} | Fetched at: {datetime.now().strftime('%H:%M:%S')}")
@@ -215,14 +227,14 @@ def main():
         unmatched = df_r[df_r["Signal"] != "🟢 ENTRY"]
 
         if not candidates.empty:
-            st.success(f"検出完了: {len(candidates)} 銘柄が条件に合致します")
+            st.success(f"検出完了: {len(candidates)} 銘柄が合致")
             for _, r in candidates.iterrows():
                 with st.container(border=True):
                     c1, c2 = st.columns([1, 3])
                     c1.metric(r["Symbol"], r["Price"])
                     c2.markdown(f"### 🚀 Signal Confirmed\n**RSI:** {r['RSI']} | 全条件クリア")
         else:
-            st.info("現在、エントリー条件を満たす銘柄はありません。")
+            st.info("条件を満たす銘柄はありません。")
 
         if not unmatched.empty:
             st.markdown("#### 監視継続リスト")
