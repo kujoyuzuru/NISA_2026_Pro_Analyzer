@@ -1,7 +1,7 @@
 {
-  "id": "trend_pullback_v1",
-  "name": "上昇トレンド中の押し目 (SMA50)",
-  "description": "SMA50より上で、かつRSI(14)が40未満",
+  "id": "trend_pullback_v2",
+  "name": "上昇トレンド中の押し目 (v2 Demo)",
+  "description": "SMA50より上で、かつRSI(14)が50未満の水準",
   "timeframe": "1d",
   "conditions": [
     {
@@ -14,11 +14,11 @@
     },
     {
       "code": "oversold_filter",
-      "name": "短期過熱感",
+      "name": "過熱感なし",
       "left": { "type": "indicator", "name": "rsi", "params": { "period": 14 } },
       "operator": "<",
-      "right": { "type": "value", "value": 40 }, 
-      "description": "RSI(14) < 40"
+      "right": { "type": "value", "value": 50 }, 
+      "description": "RSI(14) < 50"
     }
   ]
 }
