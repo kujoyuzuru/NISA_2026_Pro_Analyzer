@@ -1,6 +1,6 @@
-
 streamlit
 pandas
 yfinance
 ta
 python-dotenv
+alpaca-trade-api
