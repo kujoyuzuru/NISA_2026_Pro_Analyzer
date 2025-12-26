@@ -4,11 +4,16 @@ import pandas as pd
 import os
 import time
 
-# ★重要修正：初期化スクリプトをインポート
-# （dataフォルダに __init__.py が必要です）
-from data.init_db import init_db
+# dataフォルダのinit_dbを読み込む
+try:
+    from data.init_db import init_db
+except ImportError:
+    # パスが解決できない場合の保険（絶対パスで再トライ）
+    import sys
+    sys.path.append(os.path.abspath(os.path.dirname(__file__)))
+    from data.init_db import init_db
 
-# ページ設定（必ず最初に記述）
+# ページ設定
 st.set_page_config(
     page_title="Market Edge Pro",
     layout="wide",
@@ -19,32 +24,47 @@ st.set_page_config(
 def get_connection():
     return sqlite3.connect("trading_journal.db")
 
+# ★追加：DBが壊れていないかチェックして修復する関数★
+def ensure_db_initialized():
+    db_path = "trading_journal.db"
+    
+    # 1. ファイルがない場合 -> 作成
+    if not os.path.exists(db_path):
+        return run_init("データベースが見つかりません。新規作成します...")
+
+    # 2. ファイルはあるが、テーブルがない場合（今回のエラーはここ） -> 再作成
+    try:
+        conn = get_connection()
+        conn.execute("SELECT count(*) FROM watchlists") # テストクエリ
+        conn.close()
+    except sqlite3.OperationalError:
+        # テーブルがないエラーが出たら、再作成する
+        return run_init("データベースの中身が空です。テーブルを作成します...")
+    except Exception as e:
+        return run_init(f"DBエラー検知 ({e})。再構築します...")
+
+def run_init(msg):
+    with st.spinner(msg):
+        init_db()
+        st.success("セットアップ完了！")
+        time.sleep(1)
+        st.rerun()
+
 # メイン処理
 def main():
     st.title("Market Edge Pro v1.0")
+    
+    # 起動時に必ずDBチェックを行う
+    ensure_db_initialized()
+
     st.markdown("---")
 
-    # データベースの自動セットアップ
-    # 起動時にDBファイルがなければ、init_db() を実行して作成する
-    if not os.path.exists("trading_journal.db"):
-        with st.spinner("初回セットアップ中：データベースを作成しています..."):
-            try:
-                init_db()
-                # 作成完了のメッセージを一瞬表示
-                st.success("データベース作成完了！")
-                time.sleep(1) # ユーザーがメッセージを読めるように少し待機
-                st.rerun()    # 画面をリロードして通常起動へ
-            except Exception as e:
-                st.error(f"データベース作成に失敗しました: {e}")
-                return
-
-    # ここから通常画面の描画
     col1, col2, col3 = st.columns(3)
 
     # 左カラム：市場ステータス
     with col1:
         st.subheader("📊 Market Status")
-        st.info("Market Open (Simulation)") # 将来的にAPI連携
+        st.info("Market Open (Simulation)")
         st.metric("S&P 500", "4,780.20", "+0.5%")
 
     # 中央カラム：監視リスト情報
@@ -52,7 +72,6 @@ def main():
         st.subheader("👁 Watchlist")
         try:
             conn = get_connection()
-            # 監視リストの最初の1つを取得
             df = pd.read_sql("SELECT * FROM watchlists LIMIT 1", conn)
             conn.close()
             
@@ -65,9 +84,9 @@ def main():
             else:
                 st.warning("No watchlist found.")
         except Exception as e:
-            st.error(f"データ読み込みエラー: {e}")
+            st.error(f"読み込みエラー: {e}")
 
-    # 右カラム：リスク管理ルール
+    # 右カラム：リスク管理
     with col3:
         st.subheader("🛡 Risk Rules")
         st.write("Daily Loss Limit: **$200**")
