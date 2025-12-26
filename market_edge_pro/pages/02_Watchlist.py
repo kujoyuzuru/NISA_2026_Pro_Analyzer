@@ -4,34 +4,53 @@ import sqlite3
 import os
 import sys
 import time
+import yfinance as yf
 
 # --- セットアップ ---
 st.set_page_config(page_title="Watchlist Editor", layout="wide")
-
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if BASE_DIR not in sys.path: sys.path.append(BASE_DIR)
 DB_PATH = os.path.join(BASE_DIR, "trading_journal.db")
 
-# --- 定数: 米国株 主要100銘柄+人気ETFリスト ---
-DEFAULT_TICKERS = [
-    # Magnificent 7 / Big Tech
-    "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA",
-    # Semiconductors
-    "AMD", "AVGO", "INTC", "QCOM", "TXN", "MU", "AMAT", "LRCX", "SMCI", "ARM", "TSM",
-    # Finance
-    "JPM", "BAC", "V", "MA", "WFC", "MS", "GS", "BLK", "AXP", "PYPL",
-    # Healthcare
-    "LLY", "UNH", "JNJ", "MRK", "ABBV", "PFE", "TMO", "DHR", "ISRG",
-    # Consumer / Retail
-    "WMT", "PG", "COST", "KO", "PEP", "HD", "MCD", "NKE", "SBUX", "DIS", "NFLX",
-    # Industrial / Energy / Others
-    "XOM", "CVX", "GE", "CAT", "DE", "BA", "LMT", "RTX", "HON", "UPS", "FDX",
-    # ETFs (Popular)
-    "SPY", "VOO", "QQQ", "VTI", "SOXL", "TQQQ", "TLT", "GLD",
-    # Trending / Others
-    "PLTR", "U", "CRWD", "PANW", "SNOW", "SQ", "COIN", "MARA", "MSTR", "UBER", "ABNB"
-]
-DEFAULT_TICKERS.sort() # アルファベット順に整列
+# --- 銘柄マスターデータ（初心者向け: 名前とセクター付き） ---
+# ここに主要銘柄の情報を定義しておきます
+STOCK_MASTER = {
+    "AAPL": {"name": "Apple Inc.", "sector": "Technology"},
+    "MSFT": {"name": "Microsoft Corp.", "sector": "Technology"},
+    "GOOGL": {"name": "Alphabet Inc.", "sector": "Communication"},
+    "AMZN": {"name": "Amazon.com", "sector": "Consumer Cyclical"},
+    "NVDA": {"name": "NVIDIA Corp.", "sector": "Technology"},
+    "META": {"name": "Meta Platforms", "sector": "Communication"},
+    "TSLA": {"name": "Tesla Inc.", "sector": "Consumer Cyclical"},
+    "AMD": {"name": "Advanced Micro Devices", "sector": "Technology"},
+    "AVGO": {"name": "Broadcom Inc.", "sector": "Technology"},
+    "TSM": {"name": "Taiwan Semi", "sector": "Technology"},
+    "JPM": {"name": "JPMorgan Chase", "sector": "Financial"},
+    "V": {"name": "Visa Inc.", "sector": "Financial"},
+    "LLY": {"name": "Eli Lilly", "sector": "Healthcare"},
+    "UNH": {"name": "UnitedHealth", "sector": "Healthcare"},
+    "WMT": {"name": "Walmart Inc.", "sector": "Consumer Defensive"},
+    "PG": {"name": "Procter & Gamble", "sector": "Consumer Defensive"},
+    "KO": {"name": "Coca-Cola", "sector": "Consumer Defensive"},
+    "XOM": {"name": "Exxon Mobil", "sector": "Energy"},
+    "CVX": {"name": "Chevron Corp.", "sector": "Energy"},
+    "BA": {"name": "Boeing Co.", "sector": "Industrials"},
+    "DIS": {"name": "Walt Disney", "sector": "Communication"},
+    "NFLX": {"name": "Netflix Inc.", "sector": "Communication"},
+    "SPY": {"name": "SPDR S&P 500 ETF", "sector": "ETF"},
+    "QQQ": {"name": "Invesco QQQ ETF", "sector": "ETF"},
+    "VOO": {"name": "Vanguard S&P 500", "sector": "ETF"},
+    "VTI": {"name": "Vanguard Total Stock", "sector": "ETF"},
+    "SOXL": {"name": "Direxion Daily Semi", "sector": "ETF (Lev)"},
+    "TLT": {"name": "iShares 20+ Year Treas", "sector": "ETF (Bond)"},
+    "PLTR": {"name": "Palantir Tech", "sector": "Technology"},
+    "IONQ": {"name": "IonQ Inc.", "sector": "Technology"},
+    "COIN": {"name": "Coinbase Global", "sector": "Financial"},
+    "UBER": {"name": "Uber Technologies", "sector": "Technology"},
+}
+
+# リスト選択用の選択肢を作成
+ALL_OPTIONS = sorted(list(STOCK_MASTER.keys()))
 
 # --- DBヘルパー ---
 def get_connection():
@@ -42,15 +61,11 @@ def load_watchlist():
     try:
         df = pd.read_sql("SELECT * FROM watchlists LIMIT 1", conn)
         return df
-    except:
-        return pd.DataFrame()
-    finally:
-        conn.close()
+    except: return pd.DataFrame()
+    finally: conn.close()
 
 def save_watchlist(name, symbols_list):
-    # リストをカンマ区切り文字列に変換
     clean_list = [s.strip().upper() for s in symbols_list if s.strip()]
-    # 重複排除しつつソート
     clean_list = sorted(list(set(clean_list)))
     clean_str = ",".join(clean_list)
     
@@ -59,64 +74,165 @@ def save_watchlist(name, symbols_list):
     try:
         c.execute("UPDATE watchlists SET name = ?, symbols = ? WHERE id = (SELECT id FROM watchlists LIMIT 1)", (name, clean_str))
         conn.commit()
-        st.success(f"✅ 更新完了！ (計 {len(clean_list)} 銘柄)")
-        time.sleep(1)
-        st.rerun()
+        return clean_list
     except Exception as e:
         st.error(f"Save Error: {e}")
+        return []
     finally:
         conn.close()
 
+# --- 分析ヘルパー: 簡易AI評価 ---
+@st.cache_data(ttl=600)
+def analyze_stocks(symbols):
+    """Yahoo Financeからデータを取得し、簡易評価を行う"""
+    if not symbols: return pd.DataFrame()
+    
+    tickers = " ".join(symbols)
+    try:
+        # info取得は重いので、基本的なデータのみ一括取得して計算する軽量版AI
+        # ※本来はtickers.infoで詳細取れるが、数が多いと非常に遅いため、日足データから推測するアプローチを採用
+        df_hist = yf.download(tickers, period="1y", interval="1d", group_by='ticker', auto_adjust=True, progress=False)
+    except:
+        return pd.DataFrame()
+
+    analysis_results = []
+    
+    for sym in symbols:
+        try:
+            # データフレームの処理（単一銘柄対応）
+            if len(symbols) == 1: stock_df = df_hist
+            else: 
+                if sym not in df_hist: continue
+                stock_df = df_hist[sym]
+            
+            if stock_df.empty: continue
+
+            # 最新価格データ
+            current = float(stock_df['Close'].iloc[-1])
+            prev = float(stock_df['Close'].iloc[-2])
+            change_pct = (current - prev) / prev * 100
+            
+            # 52週高値・安値（簡易計算）
+            high_52 = float(stock_df['Close'].max())
+            low_52 = float(stock_df['Close'].min())
+            
+            # 簡易AI評価ロジック
+            # 位置（高値圏か安値圏か）
+            pos_ratio = (current - low_52) / (high_52 - low_52)
+            
+            status = "Neutral"
+            if pos_ratio > 0.9: status = "🔥 加熱 (High)"
+            elif pos_ratio < 0.2: status = "💰 割安圏 (Low)"
+            elif change_pct > 3.0: status = "🚀 急騰 (Surge)"
+            elif change_pct < -3.0: status = "😱 急落 (Drop)"
+            
+            # マスターデータから補足情報
+            meta = STOCK_MASTER.get(sym, {"name": sym, "sector": "Unknown"})
+            
+            analysis_results.append({
+                "Symbol": sym,
+                "Name": meta["name"],
+                "Sector": meta["sector"],
+                "Price": current,
+                "Change": change_pct,
+                "Position": pos_ratio, # 0(安値)-1(高値)
+                "AI Signal": status
+            })
+        except: continue
+        
+    return pd.DataFrame(analysis_results)
+
 # --- メイン画面 ---
 def main():
-    st.title("📝 監視リスト編集 (Easy Editor)")
-    st.markdown("主要銘柄リストから選択するか、検索して追加してください。")
+    st.title("📝 監視リスト管理 (Smart Editor)")
+    st.info("💡 銘柄を選ぶと、自動的に最新データとAI評価が表示されます。")
 
     df = load_watchlist()
     if df.empty: st.warning("DB未初期化"); return
 
     current_name = df.iloc[0]['name']
     current_symbols_str = df.iloc[0]['symbols']
-    
-    # DBの文字列をリストに変換
     current_list = [s.strip().upper() for s in current_symbols_str.split(",") if s.strip()]
 
-    with st.container(border=True):
-        st.subheader("設定フォーム")
-        new_name = st.text_input("リスト名", value=current_name)
-        
-        st.markdown("---")
-        
-        # ★ここが新機能: マルチセレクトUI
-        # 選択肢 = (デフォルトリスト + 現在登録されている銘柄) の重複なし和集合
-        all_options = sorted(list(set(DEFAULT_TICKERS + current_list)))
-        
-        selected_stocks = st.multiselect(
-            "💎 主要銘柄から選択 (検索可能)",
-            options=all_options,
-            default=current_list,
-            placeholder="銘柄を選択、または入力して検索..."
-        )
-        
-        # ★補完機能: リストにない銘柄を手動追加
-        with st.expander("リストにない銘柄を手動で追加する"):
-            st.caption("※ 上記のリストにない銘柄 (例: 日本株コードやマイナー株) はここに追記してください")
-            manual_add = st.text_input("手動追加 (カンマ区切り)", placeholder="例: GME, AMC")
-        
-        # 保存ボタン
-        st.markdown("###")
-        if st.button("変更を保存する (Save Changes)", type="primary"):
-            # セレクトボックスの中身 + 手動入力の中身 を合体させる
-            final_list = selected_stocks.copy()
-            if manual_add:
-                extras = [x.strip().upper() for x in manual_add.split(',')]
-                final_list.extend(extras)
+    # --- UI: 2カラムレイアウト ---
+    col1, col2 = st.columns([1, 2])
+    
+    with col1:
+        st.subheader("1. 銘柄を選択")
+        with st.container(border=True):
+            new_name = st.text_input("リスト名", value=current_name)
             
-            save_watchlist(new_name, final_list)
+            # ★改善点：フォーマット関数で「名前とセクター」を表示
+            def format_option(ticker):
+                meta = STOCK_MASTER.get(ticker)
+                if meta:
+                    return f"{ticker} | {meta['name']} ({meta['sector']})"
+                return ticker
 
-    # プレビュー
-    st.markdown("---")
-    st.markdown(f"**現在の登録銘柄 ({len(current_list)}):**")
-    st.code(", ".join(current_list))
+            # 選択肢のマージ（既存にあるけどマスターにない銘柄も対応）
+            merged_options = sorted(list(set(ALL_OPTIONS + current_list)))
+
+            selected_stocks = st.multiselect(
+                "監視対象を追加・削除",
+                options=merged_options,
+                default=current_list,
+                format_func=format_option, # ここで見やすくする
+                placeholder="銘柄を検索..."
+            )
+            
+            manual_add = st.text_input("リストにない銘柄を手動追加", placeholder="例: GME")
+            
+            if st.button("リストを更新・保存", type="primary"):
+                final_list = selected_stocks.copy()
+                if manual_add:
+                    final_list.extend([x.strip().upper() for x in manual_add.split(',')])
+                
+                saved_list = save_watchlist(new_name, final_list)
+                if saved_list:
+                    st.success("保存しました！右側の分析を更新します...")
+                    time.sleep(1)
+                    st.rerun()
+
+    with col2:
+        st.subheader("2. AI分析・評価プレビュー")
+        if not current_list:
+            st.warning("銘柄が選択されていません。")
+        else:
+            with st.spinner(f"{len(current_list)} 銘柄の最新データを分析中..."):
+                # データ取得＆分析実行
+                df_analysis = analyze_stocks(current_list)
+            
+            if not df_analysis.empty:
+                # 数値のフォーマットを整えて表示
+                st.dataframe(
+                    df_analysis,
+                    column_order=["Symbol", "Name", "Sector", "Price", "Change", "AI Signal", "Position"],
+                    column_config={
+                        "Symbol": st.column_config.TextColumn("銘柄", width="small"),
+                        "Name": st.column_config.TextColumn("企業名", width="medium"),
+                        "Sector": st.column_config.TextColumn("セクター", width="small"),
+                        "Price": st.column_config.NumberColumn("株価 ($)", format="$%.2f"),
+                        "Change": st.column_config.NumberColumn("前日比 (%)", format="%.2f%%"),
+                        "AI Signal": st.column_config.TextColumn("AI評価", width="medium"),
+                        "Position": st.column_config.ProgressColumn(
+                            "52週レンジ (安値→高値)",
+                            help="左端が52週最安値、右端が52週最高値。右に近いほど高値圏。",
+                            format="%.2f",
+                            min_value=0,
+                            max_value=1,
+                        ),
+                    },
+                    hide_index=True,
+                    use_container_width=True
+                )
+                st.caption(f"※ データ取得時刻: {time.strftime('%H:%M:%S')}")
+                st.markdown("""
+                **AI評価の読み方:**
+                - **💰 割安圏**: 過去1年の最安値に近いため、反発狙いのチャンス。
+                - **🔥 加熱**: 最高値に近いため、高値掴みに注意。
+                - **🚀 急騰 / 😱 急落**: 本日3%以上の大きな動きがあります。
+                """)
+            else:
+                st.error("データの取得に失敗しました。少し待ってから再読み込みしてください。")
 
 if __name__ == "__main__": main()
