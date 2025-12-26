@@ -4,7 +4,7 @@ import pandas as pd
 import os
 import time
 
-# dataフォルダのinit_dbを読み込む。パスが見つからない場合の保険付き
+# dataフォルダのinit_dbを読み込む（パス解決付き）
 try:
     from data.init_db import init_db
 except ImportError:
@@ -23,52 +23,47 @@ st.set_page_config(
 def get_connection():
     return sqlite3.connect("trading_journal.db")
 
-# ★ここが修復機能★
-# 起動時にDBの中身をチェックし、空っぽならテーブルを作成する
+# DB自動修復ロジック
 def ensure_db_initialized():
     db_path = "trading_journal.db"
-    
-    # ケース1: ファイル自体がない -> 作成
     if not os.path.exists(db_path):
-        return run_init("データベースファイルが見つかりません。新規作成します...")
-
-    # ケース2: ファイルはあるが中身（テーブル）がない -> 再作成
+        run_init("Creating Database...")
+        return
     try:
         conn = get_connection()
-        # わざとテーブルを読みに行ってみる
         conn.execute("SELECT count(*) FROM watchlists") 
         conn.close()
     except sqlite3.OperationalError:
-        # 「そんなテーブルないよ」と言われたら、ここに来る
-        return run_init("データベースの中身が空でした。テーブルを作成します...")
-    except Exception as e:
-        return run_init(f"DBエラーを検知しました ({e})。初期化します...")
+        run_init("Repairing Database Tables...")
+    except Exception:
+        run_init("Initializing Database...")
 
 def run_init(msg):
     with st.spinner(msg):
-        init_db() # ここで data/init_db.py を実行
-        st.success("セットアップ完了！")
+        init_db()
         time.sleep(1)
         st.rerun()
 
-# メイン画面の表示
+# メイン処理
 def main():
-    st.title("Market Edge Pro v1.0")
+    st.title("Market Edge Pro v2.0")
     
-    # ★重要：ここで必ずチェックを実行★
+    # DBチェック
     ensure_db_initialized()
+
+    # ★重要：全体免責事項
+    st.warning("⚠️ **Disclaimer:** This application is for educational and simulation purposes only. Market data may be delayed. Do not use for financial decisions.")
 
     st.markdown("---")
 
     col1, col2, col3 = st.columns(3)
 
-    # 左：市場情報
     with col1:
         st.subheader("📊 Market Status")
-        st.info("Market Open (Simulation)")
+        st.info("Status: Simulation Mode")
         st.metric("S&P 500", "4,780.20", "+0.5%")
+        st.caption("※Sample Data")
 
-    # 中：監視リスト
     with col2:
         st.subheader("👁 Watchlist")
         try:
@@ -84,10 +79,9 @@ def main():
                     st.code(", ".join(symbols))
             else:
                 st.warning("No watchlist found.")
-        except Exception as e:
-            st.error(f"読み込みエラー: {e}")
+        except Exception:
+            st.error("Watchlist Error")
 
-    # 右：リスク設定
     with col3:
         st.subheader("🛡 Risk Rules")
         st.write("Daily Loss Limit: **$200**")
@@ -95,7 +89,7 @@ def main():
 
     st.markdown("---")
     st.markdown("### Next Actions")
-    st.write("左のサイドバーから **Scanner** を選択して、今日の候補銘柄を抽出してください。")
+    st.success("👉 左サイドバーから **Scanner** を選択し、本日の候補を確認してください。")
 
 if __name__ == "__main__":
     main()
