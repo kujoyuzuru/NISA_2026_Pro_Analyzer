@@ -4,6 +4,6 @@ yfinance
 ta
 python-dotenv
 alpaca-trade-api
-alpha_vantage
+alpha-vantage==2.3.1
 requests
 urllib3
