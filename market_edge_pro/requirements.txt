@@ -3,7 +3,4 @@ pandas
 yfinance
 ta
 python-dotenv
-alpaca-trade-api
-alpha-vantage==2.3.1
 requests
-urllib3
