@@ -13,7 +13,7 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# データベース初期化ロジック
+# データベース初期化
 try: from data.init_db import init_db
 except ImportError:
     import sys
@@ -32,50 +32,36 @@ def ensure_db():
 def run_init(m):
     with st.spinner(m): init_db(); time.sleep(1); st.rerun()
 
-# --- ★修正: 市場ステータス取得 (ハイブリッド版) ---
-# ホーム画面のS&P500も、リストと同じく「15分足」で見に行き、正確な値を出す
-@st.cache_data(ttl=60) # 1分キャッシュ
+# --- ★修正: S&P500 ETF (SPY) を取得 ---
+# 指数(^GSPC)は遅延がひどいため、リアルタイム性の高いETF(SPY)をトップに置く
+@st.cache_data(ttl=30) # 30秒更新
 def get_market_status():
-    # 取得候補: まず指数(^GSPC)を試し、ダメならETF(SPY)
-    targets = ["^GSPC", "SPY"]
+    target = "SPY" 
     
-    for ticker_symbol in targets:
-        try:
-            ticker = yf.Ticker(ticker_symbol)
+    try:
+        ticker = yf.Ticker(target)
+        
+        # 15分足の最新データを取得（これで現在値はリアルタイムに近づく）
+        hist = ticker.history(period="5d", interval="15m")
+        
+        if not hist.empty:
+            current_price = float(hist['Close'].iloc[-1])
             
-            # 1. 現在値用: 直近5日間の「15分足」を取得 (これで最新価格を強制取得)
-            hist_live = ticker.history(period="5d", interval="15m")
-            if hist_live.empty: continue
-            current_price = float(hist_live['Close'].iloc[-1])
+            # 前日比の計算（日足の終値と比較）
+            # ※市場が開いている間は、yfinanceのinfoよりhistory計算の方が確実
+            prev_close = float(ticker.info.get('previousClose', hist['Close'].iloc[-2]))
             
-            # 2. 前日比用: 直近5日間の「日足」を取得 (確定した前日終値を知るため)
-            hist_daily = ticker.history(period="5d", interval="1d")
-            if len(hist_daily) < 2: continue
-            
-            # 日足の最後が「今日の作りかけ」か「昨日」か判定
-            # (簡易的に、日足の最後と現在値がほぼ同じなら、日足の最後は今日とみなして1つ前と比較)
-            last_daily_close = float(hist_daily['Close'].iloc[-1])
-            if abs(current_price - last_daily_close) < 0.001:
-                prev_close = float(hist_daily['Close'].iloc[-2])
-            else:
-                prev_close = last_daily_close
-
-            # 計算
             delta = current_price - prev_close
             delta_percent = (delta / prev_close) * 100
             
-            # 名前調整
-            name = "S&P 500" if ticker_symbol == "^GSPC" else "S&P 500 (ETF)"
+            return "S&P 500 ETF (SPY)", f"${current_price:,.2f}", f"{delta:+.2f} ({delta_percent:+.2f}%)"
             
-            return name, f"{current_price:,.2f}", f"{delta:+.2f} ({delta_percent:+.2f}%)"
+    except:
+        pass
             
-        except:
-            continue
-            
-    return "S&P 500", "Load Error", "0.00%"
+    return "S&P 500", "Data Loading...", "0.00%"
 
 def main():
-    # 規約同意
     if "tos_agreed" not in st.session_state: st.session_state.tos_agreed = False
     if not st.session_state.tos_agreed:
         st.info("👋 ようこそ。利用を開始する前に確認してください。")
@@ -88,14 +74,13 @@ def main():
 
     ensure_db()
     
-    # ロゴ表示
     st.markdown("""
         <h1 style='text-align: center; margin-bottom: 10px;'>
             📊 Market Edge Pro
         </h1>
     """, unsafe_allow_html=True)
 
-    # 市場データの取得 (エラー修正版)
+    # 市場データの取得
     idx_name, sp500_price, sp500_delta = get_market_status()
 
     st.markdown("---")
@@ -104,9 +89,9 @@ def main():
     
     with c1:
         st.subheader("📊 市場ステータス")
-        # delta_color="normal" (緑=プラス, 赤=マイナス) を自動判定
+        # SPYを表示することで、MSNなどと「色（上げ下げ）」が一致しやすくなる
         st.metric(idx_name, sp500_price, sp500_delta)
-        st.caption("Data: Yahoo Finance (Real-time approx)")
+        st.caption("Target: SPY (S&P 500 ETF)")
     
     with c2:
         st.subheader("👁 監視リスト")
@@ -117,12 +102,8 @@ def main():
             if not df.empty:
                 syms = [s.strip() for s in df.iloc[0]['symbols'].split(',') if s.strip()]
                 st.write(f"**{df.iloc[0]['name']}**")
-                
-                # スマホで見やすいよう、タグを並べる
                 if syms:
-                    # 先頭8個くらいを表示
                     display_syms = syms[:8]
-                    # codeタグを使ってチップ風に見せる
                     st.code(" ".join(display_syms) + (" ..." if len(syms)>8 else ""))
                 else:
                     st.info("銘柄が登録されていません")
@@ -131,10 +112,8 @@ def main():
 
     st.markdown("---")
     
-    # 誘導ボタン
     st.info("👇 以下のメニューから分析を開始してください")
     
-    # ページ遷移用リンク
     st.markdown("""
     <div style="text-align: center;">
         <a href="/Watchlist" target="_self" style="
