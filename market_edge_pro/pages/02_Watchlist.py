@@ -15,11 +15,37 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
+# パス設定（ルートディレクトリを認識させる）
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if BASE_DIR not in sys.path: sys.path.append(BASE_DIR)
 DB_PATH = os.path.join(BASE_DIR, "trading_journal.db")
 
-# --- ★大幅増量: 銘柄マスターデータ ---
+# --- ★追加: DB修復ロジック (app.pyと同じものを移植) ---
+try: from data.init_db import init_db
+except ImportError:
+    # パスが通っていない場合の保険
+    import sys
+    sys.path.append(BASE_DIR)
+    from data.init_db import init_db
+
+def ensure_db():
+    # DBファイルがない、または壊れている場合に再生成する
+    if not os.path.exists(DB_PATH):
+        with st.spinner("System Initializing..."):
+            init_db()
+            time.sleep(1)
+            st.rerun()
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("SELECT count(*) FROM watchlists")
+        conn.close()
+    except:
+        with st.spinner("Database Repairing..."):
+            init_db()
+            time.sleep(1)
+            st.rerun()
+
+# --- 銘柄マスターデータ ---
 STOCK_MASTER = {
     # --- 📊 主要インデックス & ETF ---
     "SPY": {"name": "SPDR S&P 500", "sector": "INDEX: S&P500"},
@@ -84,8 +110,6 @@ STOCK_MASTER = {
     "JNJ": {"name": "Johnson & Johnson", "sector": "Health"},
     "BA": {"name": "Boeing Co.", "sector": "Aero"},
 }
-
-# リストの並び順（人気順）
 POPULAR_ORDER = list(STOCK_MASTER.keys())
 
 # --- DBヘルパー ---
@@ -123,7 +147,6 @@ def analyze_stocks_pro(symbols):
     
     tickers_str = " ".join(symbols)
     try:
-        # テクニカル指標用（日足）
         df_hist = yf.download(tickers_str, period="6mo", interval="1d", group_by='ticker', auto_adjust=True, progress=False)
     except: return pd.DataFrame()
 
@@ -207,6 +230,9 @@ def color_change_text(val):
 
 # --- メイン画面 ---
 def main():
+    # ★ここが重要：起動時にDBチェックを行う
+    ensure_db()
+
     st.markdown("""
         <h1 style='text-align: center; margin-bottom: 20px;'>
             📊 Market Edge Pro
@@ -214,7 +240,16 @@ def main():
     """, unsafe_allow_html=True)
     
     df = load_watchlist()
-    if df.empty: st.warning("DBエラー"); return
+    if df.empty: 
+        # 修復してもまだダメなら再試行ボタンを出す
+        st.error("データベース読み込みエラー。再読み込みしてください。")
+        if st.button("データベース修復・再接続"):
+            with st.spinner("Repairing..."):
+                init_db()
+                time.sleep(1)
+                st.rerun()
+        return
+
     curr_list = [s.strip().upper() for s in df.iloc[0]['symbols'].split(",") if s.strip()]
 
     col_main, = st.columns([1])
@@ -284,7 +319,6 @@ def main():
         st.header("🛠 銘柄管理")
         def fmt(t):
             m = STOCK_MASTER.get(t)
-            # 選択肢を見やすく： "AAPL | Apple Inc. (Tech)"
             return f"{t} | {m['name']} ({m['sector']})" if m else t
 
         merged_opts = POPULAR_ORDER + [x for x in curr_list if x not in POPULAR_ORDER]
