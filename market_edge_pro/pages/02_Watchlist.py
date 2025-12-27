@@ -19,8 +19,9 @@ BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if BASE_DIR not in sys.path: sys.path.append(BASE_DIR)
 DB_PATH = os.path.join(BASE_DIR, "trading_journal.db")
 
-# --- 銘柄マスターデータ (省略なし) ---
+# --- ★大幅増量: 銘柄マスターデータ ---
 STOCK_MASTER = {
+    # --- 📊 主要インデックス & ETF ---
     "SPY": {"name": "SPDR S&P 500", "sector": "INDEX: S&P500"},
     "QQQ": {"name": "Invesco QQQ", "sector": "INDEX: NASDAQ100"},
     "VOO": {"name": "Vanguard S&P 500", "sector": "INDEX: S&P500"},
@@ -30,28 +31,40 @@ STOCK_MASTER = {
     "SOXL": {"name": "Direxion Daily Semi 3x", "sector": "ETF: Semi 3x"},
     "TQQQ": {"name": "ProShares UltraPro QQQ", "sector": "ETF: Nasdaq 3x"},
     "TLT": {"name": "iShares 20+ Year Treasury", "sector": "ETF: Bond 20y"},
+    
+    # --- 🔥 超人気・マグニフィセント7 ---
     "NVDA": {"name": "NVIDIA Corp.", "sector": "Tech"},
     "TSLA": {"name": "Tesla Inc.", "sector": "Auto"},
     "AAPL": {"name": "Apple Inc.", "sector": "Tech"},
-    "AMD": {"name": "Advanced Micro Devices", "sector": "Tech"},
-    "AMZN": {"name": "Amazon.com", "sector": "Retail"},
     "MSFT": {"name": "Microsoft Corp.", "sector": "Tech"},
     "GOOGL": {"name": "Alphabet Inc.", "sector": "Comm"},
+    "AMZN": {"name": "Amazon.com", "sector": "Retail"},
     "META": {"name": "Meta Platforms", "sector": "Comm"},
-    "PLTR": {"name": "Palantir Technologies", "sector": "Software"},
-    "COIN": {"name": "Coinbase Global", "sector": "Crypto"},
-    "MARA": {"name": "Marathon Digital", "sector": "Crypto"},
-    "MSTR": {"name": "MicroStrategy", "sector": "Software"},
+    
+    # --- 🚀 半導体 & AI ---
+    "AMD": {"name": "Advanced Micro Devices", "sector": "Tech"},
     "AVGO": {"name": "Broadcom Inc.", "sector": "Semi"},
     "TSM": {"name": "Taiwan Semi", "sector": "Semi"},
     "ARM": {"name": "Arm Holdings", "sector": "Semi"},
     "SMCI": {"name": "Super Micro Computer", "sector": "Hardware"},
+    "INTC": {"name": "Intel Corp.", "sector": "Semi"},
+    "MU": {"name": "Micron Technology", "sector": "Semi"},
+
+    # --- 💻 グロース & ソフトウェア ---
+    "PLTR": {"name": "Palantir Technologies", "sector": "Software"},
     "CRWD": {"name": "CrowdStrike", "sector": "Security"},
     "PANW": {"name": "Palo Alto Networks", "sector": "Security"},
     "SNOW": {"name": "Snowflake Inc.", "sector": "Software"},
     "U": {"name": "Unity Software", "sector": "Software"},
     "UBER": {"name": "Uber Technologies", "sector": "App"},
     "ABNB": {"name": "Airbnb Inc.", "sector": "Travel"},
+    
+    # --- 💰 クリプト関連 ---
+    "COIN": {"name": "Coinbase Global", "sector": "Crypto"},
+    "MARA": {"name": "Marathon Digital", "sector": "Crypto"},
+    "MSTR": {"name": "MicroStrategy", "sector": "Software"},
+
+    # --- 🏦 金融 & 伝統的大手 ---
     "JPM": {"name": "JPMorgan Chase", "sector": "Bank"},
     "BAC": {"name": "Bank of America", "sector": "Bank"},
     "V": {"name": "Visa Inc.", "sector": "Credit"},
@@ -68,12 +81,11 @@ STOCK_MASTER = {
     "CVX": {"name": "Chevron Corp.", "sector": "Energy"},
     "LLY": {"name": "Eli Lilly", "sector": "Pharma"},
     "UNH": {"name": "UnitedHealth", "sector": "Health"},
-    "PFE": {"name": "Pfizer Inc.", "sector": "Pharma"},
     "JNJ": {"name": "Johnson & Johnson", "sector": "Health"},
     "BA": {"name": "Boeing Co.", "sector": "Aero"},
-    "CAT": {"name": "Caterpillar", "sector": "Industry"},
-    "GE": {"name": "General Electric", "sector": "Industry"},
 }
+
+# リストの並び順（人気順）
 POPULAR_ORDER = list(STOCK_MASTER.keys())
 
 # --- DBヘルパー ---
@@ -111,6 +123,7 @@ def analyze_stocks_pro(symbols):
     
     tickers_str = " ".join(symbols)
     try:
+        # テクニカル指標用（日足）
         df_hist = yf.download(tickers_str, period="6mo", interval="1d", group_by='ticker', auto_adjust=True, progress=False)
     except: return pd.DataFrame()
 
@@ -119,7 +132,7 @@ def analyze_stocks_pro(symbols):
     results = []
     for sym in symbols:
         try:
-            # --- A. 正確な価格データの取得 ---
+            # A. 正確な価格データの取得
             try:
                 info = tickers_obj.tickers[sym].fast_info
                 current_price = info.last_price
@@ -130,7 +143,7 @@ def analyze_stocks_pro(symbols):
                 change_pct = (change_val / prev_close) * 100
             except: continue
 
-            # --- B. テクニカル指標 ---
+            # B. テクニカル指標
             if len(symbols) == 1: sdf = df_hist
             else: 
                 if sym not in df_hist: continue
@@ -142,11 +155,10 @@ def analyze_stocks_pro(symbols):
             rsi = ta.momentum.RSIIndicator(sdf['Close'], window=14).rsi().iloc[-1]
             trend_up = current_price > sma50
             
-            # --- C. 判定ロジック (明確化) ---
+            # C. 判定ロジック
             verdict, score, reason_short = "", 0, ""
             
             if trend_up:
-                # RSIの数値で明確に区切る
                 if rsi < 35:
                     verdict, score = "💎 超・買い時", 100
                     reason_short = "RSI<35: 絶好の拾い場"
@@ -155,7 +167,7 @@ def analyze_stocks_pro(symbols):
                     reason_short = "RSI<50: 買いチャンス"
                 elif rsi < 55:
                     verdict, score = "○ 保有/監視", 60
-                    reason_short = "あと少しで買い (RSI 50台)" # ★親切機能
+                    reason_short = "あと少しで買い (RSI 50台)"
                 elif rsi > 75:
                     verdict, score = "⚡ 利確検討", -10
                     reason_short = "RSI>75: 加熱しすぎ"
@@ -178,7 +190,7 @@ def analyze_stocks_pro(symbols):
                 "Trend": "📈 上昇" if trend_up else "📉 下降",
                 "Verdict": verdict,
                 "Score": score,
-                "Reason": reason_short # 理由を短く表示
+                "Reason": reason_short
             })
         except: continue
     
@@ -223,7 +235,6 @@ def main():
                 df_anl = analyze_stocks_pro(curr_list)
 
             if not df_anl.empty:
-                # ユーザーに見せるカラムを整理
                 display_df = df_anl[["Verdict", "Symbol", "Price", "Change", "RSI", "Reason"]].copy()
                 display_df.columns = ["Verdict", "Symbol", "Price", "Change", "RSI (過熱感)", "状況コメント"]
                 
@@ -239,7 +250,7 @@ def main():
                         "Price": st.column_config.NumberColumn("現在値", format="$%.2f"),
                         "Change": st.column_config.NumberColumn("前日比", format="%.2f%%"),
                         "RSI (過熱感)": st.column_config.ProgressColumn(
-                            "RSI (50以下で買い)", # ★ヘッダーで答えを言ってしまう
+                            "RSI (50以下で買い)", 
                             help="【買い基準】50以下: 押し目買い / 35以下: 超・買い時",
                             format="%d",
                             min_value=0,
@@ -252,7 +263,6 @@ def main():
                     height=600
                 )
                 
-                # ★ここを明確に修正：基準値をハッキリ書く
                 with st.expander("💡 判定基準（カンニングペーパー）", expanded=True):
                     st.markdown("""
                     **このAIは「上昇トレンドの押し目（一時的な下落）」を狙っています。**
@@ -274,7 +284,9 @@ def main():
         st.header("🛠 銘柄管理")
         def fmt(t):
             m = STOCK_MASTER.get(t)
+            # 選択肢を見やすく： "AAPL | Apple Inc. (Tech)"
             return f"{t} | {m['name']} ({m['sector']})" if m else t
+
         merged_opts = POPULAR_ORDER + [x for x in curr_list if x not in POPULAR_ORDER]
         sel = st.multiselect("監視リスト", options=merged_opts, default=curr_list, format_func=fmt, placeholder="銘柄を検索...")
         manual = st.text_input("手動追加", placeholder="例: GME")
