@@ -3,7 +3,6 @@ import pandas as pd
 import sqlite3
 import os
 import sys
-import time
 import yfinance as yf
 import ta
 
@@ -15,39 +14,91 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# パス設定（ルートディレクトリを認識させる）
+# パス設定
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-if BASE_DIR not in sys.path: sys.path.append(BASE_DIR)
 DB_PATH = os.path.join(BASE_DIR, "trading_journal.db")
 
-# --- ★追加: DB修復ロジック (app.pyと同じものを移植) ---
-try: from data.init_db import init_db
-except ImportError:
-    # パスが通っていない場合の保険
-    import sys
-    sys.path.append(BASE_DIR)
-    from data.init_db import init_db
-
-def ensure_db():
-    # DBファイルがない、または壊れている場合に再生成する
-    if not os.path.exists(DB_PATH):
-        with st.spinner("System Initializing..."):
-            init_db()
-            time.sleep(1)
-            st.rerun()
+# --- ★修正: DB修復ロジック (自己完結型) ---
+# 外部ファイルを読み込まず、ここで直接直すことでループを防ぐ
+def fix_db_now():
+    """データベースを強制的に作り直す関数"""
     try:
+        # 壊れたファイルがあれば削除トライ
+        if os.path.exists(DB_PATH):
+            try: os.remove(DB_PATH)
+            except: pass
+        
+        # 新規作成
         conn = sqlite3.connect(DB_PATH)
-        conn.execute("SELECT count(*) FROM watchlists")
+        c = conn.cursor()
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS watchlists (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                symbols TEXT NOT NULL
+            )
+        ''')
+        # デフォルトデータ投入
+        default_symbols = "AAPL,MSFT,TSLA,NVDA,GOOGL,AMZN,META,AMD"
+        c.execute("INSERT INTO watchlists (name, symbols) VALUES (?, ?)", 
+                 ("Default Watchlist", default_symbols))
+        conn.commit()
         conn.close()
+        return True
     except:
-        with st.spinner("Database Repairing..."):
-            init_db()
-            time.sleep(1)
-            st.rerun()
+        return False
+
+def get_connection():
+    """安全な接続を取得"""
+    return sqlite3.connect(DB_PATH)
+
+def load_watchlist():
+    """リストを読み込む（失敗したら即座に直す）"""
+    try:
+        conn = get_connection()
+        df = pd.read_sql("SELECT * FROM watchlists LIMIT 1", conn)
+        conn.close()
+        if df.empty:
+            # テーブルはあるが空っぽの場合 -> 直す
+            fix_db_now()
+            # 直した直後に読み直す
+            conn = get_connection()
+            df = pd.read_sql("SELECT * FROM watchlists LIMIT 1", conn)
+            conn.close()
+        return df
+    except:
+        # DBファイルがない、または壊れている場合 -> 直す
+        fix_db_now()
+        # 直した直後に読み直す
+        try:
+            conn = get_connection()
+            df = pd.read_sql("SELECT * FROM watchlists LIMIT 1", conn)
+            conn.close()
+            return df
+        except:
+            return pd.DataFrame() # それでもダメなら空を返す(エラー画面回避)
+
+def save_watchlist(name, symbols_list):
+    clean_list = []
+    seen = set()
+    for s in symbols_list:
+        clean_s = s.strip().upper()
+        if clean_s and clean_s not in seen:
+            clean_list.append(clean_s)
+            seen.add(clean_s)
+    clean_str = ",".join(clean_list)
+    
+    try:
+        conn = get_connection()
+        conn.execute("UPDATE watchlists SET name = ?, symbols = ? WHERE id = (SELECT id FROM watchlists LIMIT 1)", (name, clean_str))
+        conn.commit()
+        conn.close()
+        return clean_list
+    except:
+        return []
 
 # --- 銘柄マスターデータ ---
 STOCK_MASTER = {
-    # --- 📊 主要インデックス & ETF ---
     "SPY": {"name": "SPDR S&P 500", "sector": "INDEX: S&P500"},
     "QQQ": {"name": "Invesco QQQ", "sector": "INDEX: NASDAQ100"},
     "VOO": {"name": "Vanguard S&P 500", "sector": "INDEX: S&P500"},
@@ -57,8 +108,6 @@ STOCK_MASTER = {
     "SOXL": {"name": "Direxion Daily Semi 3x", "sector": "ETF: Semi 3x"},
     "TQQQ": {"name": "ProShares UltraPro QQQ", "sector": "ETF: Nasdaq 3x"},
     "TLT": {"name": "iShares 20+ Year Treasury", "sector": "ETF: Bond 20y"},
-    
-    # --- 🔥 超人気・マグニフィセント7 ---
     "NVDA": {"name": "NVIDIA Corp.", "sector": "Tech"},
     "TSLA": {"name": "Tesla Inc.", "sector": "Auto"},
     "AAPL": {"name": "Apple Inc.", "sector": "Tech"},
@@ -66,8 +115,6 @@ STOCK_MASTER = {
     "GOOGL": {"name": "Alphabet Inc.", "sector": "Comm"},
     "AMZN": {"name": "Amazon.com", "sector": "Retail"},
     "META": {"name": "Meta Platforms", "sector": "Comm"},
-    
-    # --- 🚀 半導体 & AI ---
     "AMD": {"name": "Advanced Micro Devices", "sector": "Tech"},
     "AVGO": {"name": "Broadcom Inc.", "sector": "Semi"},
     "TSM": {"name": "Taiwan Semi", "sector": "Semi"},
@@ -75,8 +122,6 @@ STOCK_MASTER = {
     "SMCI": {"name": "Super Micro Computer", "sector": "Hardware"},
     "INTC": {"name": "Intel Corp.", "sector": "Semi"},
     "MU": {"name": "Micron Technology", "sector": "Semi"},
-
-    # --- 💻 グロース & ソフトウェア ---
     "PLTR": {"name": "Palantir Technologies", "sector": "Software"},
     "CRWD": {"name": "CrowdStrike", "sector": "Security"},
     "PANW": {"name": "Palo Alto Networks", "sector": "Security"},
@@ -84,13 +129,9 @@ STOCK_MASTER = {
     "U": {"name": "Unity Software", "sector": "Software"},
     "UBER": {"name": "Uber Technologies", "sector": "App"},
     "ABNB": {"name": "Airbnb Inc.", "sector": "Travel"},
-    
-    # --- 💰 クリプト関連 ---
     "COIN": {"name": "Coinbase Global", "sector": "Crypto"},
     "MARA": {"name": "Marathon Digital", "sector": "Crypto"},
     "MSTR": {"name": "MicroStrategy", "sector": "Software"},
-
-    # --- 🏦 金融 & 伝統的大手 ---
     "JPM": {"name": "JPMorgan Chase", "sector": "Bank"},
     "BAC": {"name": "Bank of America", "sector": "Bank"},
     "V": {"name": "Visa Inc.", "sector": "Credit"},
@@ -112,34 +153,6 @@ STOCK_MASTER = {
 }
 POPULAR_ORDER = list(STOCK_MASTER.keys())
 
-# --- DBヘルパー ---
-def get_connection(): return sqlite3.connect(DB_PATH)
-
-def load_watchlist():
-    conn = get_connection()
-    try:
-        df = pd.read_sql("SELECT * FROM watchlists LIMIT 1", conn)
-        return df
-    except: return pd.DataFrame()
-    finally: conn.close()
-
-def save_watchlist(name, symbols_list):
-    clean_list = []
-    seen = set()
-    for s in symbols_list:
-        clean_s = s.strip().upper()
-        if clean_s and clean_s not in seen:
-            clean_list.append(clean_s)
-            seen.add(clean_s)
-    clean_str = ",".join(clean_list)
-    conn = get_connection()
-    try:
-        conn.execute("UPDATE watchlists SET name = ?, symbols = ? WHERE id = (SELECT id FROM watchlists LIMIT 1)", (name, clean_str))
-        conn.commit()
-        return clean_list
-    except: return []
-    finally: conn.close()
-
 # --- 分析ロジック (Fast Info実装版) ---
 @st.cache_data(ttl=15)
 def analyze_stocks_pro(symbols):
@@ -147,6 +160,7 @@ def analyze_stocks_pro(symbols):
     
     tickers_str = " ".join(symbols)
     try:
+        # テクニカル指標用（日足）
         df_hist = yf.download(tickers_str, period="6mo", interval="1d", group_by='ticker', auto_adjust=True, progress=False)
     except: return pd.DataFrame()
 
@@ -230,90 +244,80 @@ def color_change_text(val):
 
 # --- メイン画面 ---
 def main():
-    # ★ここが重要：起動時にDBチェックを行う
-    ensure_db()
-
     st.markdown("""
         <h1 style='text-align: center; margin-bottom: 20px;'>
             📊 Market Edge Pro
         </h1>
     """, unsafe_allow_html=True)
     
+    # データを読み込む（ダメなら内部で勝手に直してデータを返す）
     df = load_watchlist()
-    if df.empty: 
-        # 修復してもまだダメなら再試行ボタンを出す
-        st.error("データベース読み込みエラー。再読み込みしてください。")
-        if st.button("データベース修復・再接続"):
-            with st.spinner("Repairing..."):
-                init_db()
-                time.sleep(1)
-                st.rerun()
-        return
-
-    curr_list = [s.strip().upper() for s in df.iloc[0]['symbols'].split(",") if s.strip()]
+    
+    # それでも万が一データがない場合の安全策
+    if df.empty:
+        curr_list = ["AAPL", "NVDA", "TSLA"] # 強制デフォルト
+    else:
+        curr_list = [s.strip().upper() for s in df.iloc[0]['symbols'].split(",") if s.strip()]
 
     col_main, = st.columns([1])
 
     with col_main:
-        if not curr_list:
-             st.info("👈 サイドバーから監視銘柄を追加してください")
+        c_head, c_btn = st.columns([3, 1])
+        with c_head:
+            st.subheader("AI 売買判断ダッシュボード")
+        with c_btn:
+            if st.button("🔄 更新"):
+                st.cache_data.clear()
+                st.rerun()
+
+        with st.spinner("市場データを分析中..."):
+            df_anl = analyze_stocks_pro(curr_list)
+
+        if not df_anl.empty:
+            display_df = df_anl[["Verdict", "Symbol", "Price", "Change", "RSI", "Reason"]].copy()
+            display_df.columns = ["Verdict", "Symbol", "Price", "Change", "RSI (過熱感)", "状況コメント"]
+            
+            st.dataframe(
+                display_df.style.format({
+                    "Price": "${:,.2f}",
+                    "Change": "{:+.2f}%",
+                }).map(color_change_text, subset=["Change"]),
+                
+                column_config={
+                    "Verdict": st.column_config.TextColumn("AI判定", width="medium"),
+                    "Symbol": st.column_config.TextColumn("銘柄", width="small"),
+                    "Price": st.column_config.NumberColumn("現在値", format="$%.2f"),
+                    "Change": st.column_config.NumberColumn("前日比", format="%.2f%%"),
+                    "RSI (過熱感)": st.column_config.ProgressColumn(
+                        "RSI (50以下で買い)", 
+                        help="【買い基準】50以下: 押し目買い / 35以下: 超・買い時",
+                        format="%d",
+                        min_value=0,
+                        max_value=100,
+                    ),
+                    "状況コメント": st.column_config.TextColumn("状況コメント", width="medium"),
+                },
+                hide_index=True,
+                use_container_width=True,
+                height=600
+            )
+            
+            with st.expander("💡 判定基準（カンニングペーパー）", expanded=True):
+                st.markdown("""
+                **このAIは「上昇トレンドの押し目（一時的な下落）」を狙っています。**
+                
+                | 判定シグナル | RSIの基準値 | 意味 |
+                | :--- | :--- | :--- |
+                | 💎 **超・買い時** | **35 以下** | バーゲンセール状態。迷わずエントリー。 |
+                | ◎ **押し目買い** | **50 以下** | 加熱感が冷めた状態。ここから買い。 |
+                | ○ **保有/監視** | **50〜75** | 順調。慌てて買う必要なし（下がるのを待つ）。 |
+                | ⚡ **利確検討** | **75 以上** | 買われすぎ。急落に注意。 |
+                
+                ※ **前提条件:** 株価が50日移動平均線より上にあること（＝上昇トレンド）。
+                """)
+            
         else:
-            c_head, c_btn = st.columns([3, 1])
-            with c_head:
-                st.subheader("AI 売買判断ダッシュボード")
-            with c_btn:
-                if st.button("🔄 更新"):
-                    st.cache_data.clear()
-                    st.rerun()
-
-            with st.spinner("市場データを分析中..."):
-                df_anl = analyze_stocks_pro(curr_list)
-
-            if not df_anl.empty:
-                display_df = df_anl[["Verdict", "Symbol", "Price", "Change", "RSI", "Reason"]].copy()
-                display_df.columns = ["Verdict", "Symbol", "Price", "Change", "RSI (過熱感)", "状況コメント"]
-                
-                st.dataframe(
-                    display_df.style.format({
-                        "Price": "${:,.2f}",
-                        "Change": "{:+.2f}%",
-                    }).map(color_change_text, subset=["Change"]),
-                    
-                    column_config={
-                        "Verdict": st.column_config.TextColumn("AI判定", width="medium"),
-                        "Symbol": st.column_config.TextColumn("銘柄", width="small"),
-                        "Price": st.column_config.NumberColumn("現在値", format="$%.2f"),
-                        "Change": st.column_config.NumberColumn("前日比", format="%.2f%%"),
-                        "RSI (過熱感)": st.column_config.ProgressColumn(
-                            "RSI (50以下で買い)", 
-                            help="【買い基準】50以下: 押し目買い / 35以下: 超・買い時",
-                            format="%d",
-                            min_value=0,
-                            max_value=100,
-                        ),
-                        "状況コメント": st.column_config.TextColumn("状況コメント", width="medium"),
-                    },
-                    hide_index=True,
-                    use_container_width=True,
-                    height=600
-                )
-                
-                with st.expander("💡 判定基準（カンニングペーパー）", expanded=True):
-                    st.markdown("""
-                    **このAIは「上昇トレンドの押し目（一時的な下落）」を狙っています。**
-                    
-                    | 判定シグナル | RSIの基準値 | 意味 |
-                    | :--- | :--- | :--- |
-                    | 💎 **超・買い時** | **35 以下** | バーゲンセール状態。迷わずエントリー。 |
-                    | ◎ **押し目買い** | **50 以下** | 加熱感が冷めた状態。ここから買い。 |
-                    | ○ **保有/監視** | **50〜75** | 順調。慌てて買う必要なし（下がるのを待つ）。 |
-                    | ⚡ **利確検討** | **75 以上** | 買われすぎ。急落に注意。 |
-                    
-                    ※ **前提条件:** 株価が50日移動平均線より上にあること（＝上昇トレンド）。
-                    """)
-                
-            else:
-                st.error("データ取得失敗。時間をおいて再試行してください。")
+            st.error("データ取得失敗。時間をおいて再試行してください。")
     
     with st.sidebar:
         st.header("🛠 銘柄管理")
@@ -327,7 +331,7 @@ def main():
         if st.button("リストを保存して更新", type="primary", use_container_width=True):
             final = sel.copy()
             if manual: final.extend([x.strip().upper() for x in manual.split(',')])
-            save_watchlist(df.iloc[0]['name'], final)
+            save_watchlist("Default Watchlist", final)
             st.cache_data.clear()
             st.rerun()
 
