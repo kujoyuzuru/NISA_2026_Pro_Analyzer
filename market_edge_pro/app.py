@@ -32,31 +32,52 @@ def ensure_db():
 def run_init(m):
     with st.spinner(m): init_db(); time.sleep(1); st.rerun()
 
-# --- ★修正: 最軽量・高速なデータ取得 (Fast Info) ---
-# history()を使わず、fast_infoを使うことでエラーと待ち時間をなくす
-@st.cache_data(ttl=30)
+# --- ★修正: 鉄壁のデータ取得ロジック ---
+# サーバーでブロックされにくいよう、キャッシュ時間を少し伸ばし(60秒)、
+# 失敗したら別の方法で取りに行く「二段構え」にします。
+@st.cache_data(ttl=60)
 def get_market_status():
     target = "SPY"
     
+    # 【作戦1】まずは最も確実な「history (過去データ)」から取得
+    # ※サーバー上ではこれが一番安定します
     try:
         ticker = yf.Ticker(target)
+        # 直近5日分のデータを取得（休日またぎ対策）
+        hist = ticker.history(period="5d", interval="1d")
         
-        # fast_infoは通信量が少なく、一瞬で「現在値」と「前日終値」だけを取れる
-        # これならタイムアウトやデータ欠損がほぼ起きない
-        current_price = ticker.fast_info.last_price
-        prev_close = ticker.fast_info.previous_close
-        
-        if current_price and prev_close:
+        if not hist.empty and len(hist) >= 1:
+            # 最新の終値（または現在値）
+            current_price = float(hist['Close'].iloc[-1])
+            
+            # 前日終値の取得（データが2行以上あれば1つ前を使う）
+            if len(hist) >= 2:
+                prev_close = float(hist['Close'].iloc[-2])
+            else:
+                # データが1行しかない場合は、infoから前日比を探す（バックアップ）
+                prev_close = float(ticker.info.get('previousClose', current_price))
+
             delta = current_price - prev_close
             delta_percent = (delta / prev_close) * 100
             
             return "S&P 500 ETF (SPY)", f"${current_price:,.2f}", f"{delta:+.2f} ({delta_percent:+.2f}%)"
-            
     except:
-        # 万が一失敗した場合は、エラーではなく「---」を表示してアプリを止めない
+        pass # 作戦1が失敗したら、作戦2へ
+
+    # 【作戦2】historyがダメなら「fast_info (板情報)」を試す
+    try:
+        ticker = yf.Ticker(target)
+        curr = ticker.fast_info.last_price
+        prev = ticker.fast_info.previous_close
+        if curr and prev:
+            delta = curr - prev
+            pct = (delta / prev) * 100
+            return "S&P 500 ETF (SPY)", f"${curr:,.2f}", f"{delta:+.2f} ({pct:+.2f}%)"
+    except:
         pass
-            
-    return "S&P 500 (SPY)", "$---", "0.00%"
+
+    # 全部ダメだった場合
+    return "S&P 500 (SPY)", "$---", "Loading..."
 
 def main():
     if "tos_agreed" not in st.session_state: st.session_state.tos_agreed = False
@@ -71,13 +92,13 @@ def main():
 
     ensure_db()
     
+    # リンクアイコン風の装飾を削除してシンプルに
     st.markdown("""
         <h1 style='text-align: center; margin-bottom: 10px;'>
             📊 Market Edge Pro
         </h1>
     """, unsafe_allow_html=True)
 
-    # 高速データ取得
     idx_name, sp500_price, sp500_delta = get_market_status()
 
     st.markdown("---")
@@ -87,8 +108,7 @@ def main():
     with c1:
         st.subheader("📊 市場ステータス")
         st.metric(idx_name, sp500_price, sp500_delta)
-        # ちゃんとSPYであることを明記
-        st.caption("Target: SPY (S&P 500 ETF) | Real-time Quote")
+        st.caption("Target: SPY (S&P 500 ETF)")
     
     with c2:
         st.subheader("👁 監視リスト")
